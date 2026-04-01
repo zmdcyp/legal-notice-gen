@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# 上传和输出目录
+uploads/
+output/
+
+# 测试产物
+test_*.pdf
+test_*.zip
+*.pdf
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# 临时文件
+*.tmp
