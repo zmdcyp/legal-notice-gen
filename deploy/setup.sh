@@ -41,6 +41,9 @@ mkdir -p "$APP_DIR/uploads"
 chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 
 # 4. 创建 systemd 服务
+# 重要：task 状态保存在进程内存中，必须使用 --workers 1 + --threads N，
+# 否则 /status 和 /download 轮询会落到其他 worker 拿不到任务状态。
+# --timeout 1800 让单个后台任务最多跑 30 分钟。
 echo "[4/6] 配置 systemd 服务..."
 cat > /etc/systemd/system/$APP_NAME.service << 'EOF'
 [Unit]
@@ -55,8 +58,11 @@ WorkingDirectory=/opt/legal_notice_gen
 Environment="PATH=/opt/legal_notice_gen/venv/bin:/usr/bin"
 ExecStart=/opt/legal_notice_gen/venv/bin/gunicorn \
     --bind 127.0.0.1:5002 \
-    --workers 2 \
-    --timeout 120 \
+    --workers 1 \
+    --threads 16 \
+    --worker-class gthread \
+    --timeout 1800 \
+    --graceful-timeout 60 \
     legal_notice_gen:app
 Restart=always
 RestartSec=5
@@ -70,19 +76,23 @@ systemctl enable $APP_NAME
 systemctl start $APP_NAME
 
 # 5. 配置 Nginx 反向代理
+# client_max_body_size 100M: 允许大 Excel / 模板。
+# proxy_read_timeout 1800s: 允许 /download 在大批量生成时长时间流式传输。
 echo "[5/6] 配置 Nginx..."
 cat > /etc/nginx/sites-available/$APP_NAME << 'EOF'
 server {
     listen 80;
     server_name _;
-    client_max_body_size 50M;
+    client_max_body_size 100M;
 
     location / {
         proxy_pass http://127.0.0.1:5002;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_read_timeout 120s;
+        proxy_read_timeout 1800s;
+        proxy_send_timeout 1800s;
+        proxy_buffering off;
     }
 }
 EOF

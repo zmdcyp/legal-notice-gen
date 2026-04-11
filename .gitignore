@@ -17,9 +17,16 @@ test_*.zip
 # IDE
 .vscode/
 .idea/
+.claude/
 
 # macOS
 .DS_Store
 
 # 临时文件
 *.tmp
+
+# 本地原始数据 / 草稿（不进仓库）
+原始数据/
+*.xlsx
+*.docx
+*.png
