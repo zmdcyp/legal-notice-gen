@@ -2,6 +2,92 @@
 
 本文件记录项目的重要变更。格式：按日期倒序，最新的变更在最上面。
 
+## 2026-04-16 (安全加固 + 历史审计)
+
+一次把 `/review` 扫出来的 Top-5 全修了，同时落地**历史记录 + 序列号反查**。
+修的是真 bug，不是缝缝补补——其中一个（`hash(name)` 不稳定）直接让之前
+承诺的"同一姓名永远同一序列号"失效。
+
+### 修复
+
+- **#1 · `hash(name)` 不稳定 → `_name_seed(name)`（hashlib.sha256）**
+  - CPython 的 `hash(str)` 在每个进程启动时用随机 salt（`PYTHONHASHSEED`
+    默认 random），所以 `hash("Ali Hassan")` 在两次启动、两个 ProcessPool
+    worker 之间都**完全不同**
+  - 直接后果：`ANTI_COUNTERFEIT.md` 承诺的"律所反查 = 重跑 `generate_qr_serial
+    (姓名)` 对比"失效——服务重启一次就对不上；并且同一批次里不同 worker
+    产生的律师函序列号都不一致
+  - 修复：新增 `_name_seed(name)`，用 `hashlib.sha256` 的前 8 字节作种子，
+    跨进程 / 跨主机 / 跨 Python 版本都一致
+  - 实测 3 个进程跑同一姓名：seed 全部 `bd40775ebdc9b7ec`，serial 全部
+    `5B7F-U3YD-BV5X-JJXM`
+  - 覆盖 3 处 `hash(name) & 0xFFFFFFFF` 调用（水印、QR 序列、印章旋转）
+
+- **#2 · XSS in `build_notice_html` 占位符替换**
+  - 原代码：`html = html.replace("{{"+k+"}}", _format_value(v))` 没有转义
+  - 影响：Excel 单元格 / Manual 表单 / `/api/preview_html` body 里的
+    `<img src=x onerror=fetch('/logout')>` 在预览 iframe（同源）**直接执行**，
+    也在 Chromium 渲染 PDF 时执行（`file://` 协议可读本地文件外传）
+  - 修复：加一行 `_htmllib.escape(_format_value(v), quote=False)`
+
+- **#3 · Path traversal via `<slug>` URL 参数**
+  - 原代码：6 个 `<slug>` 路由 + 3 处 body 里的 slug 字段都没校验正则
+  - 影响：`GET /api/templates/../foo/assets/logo` 解析到 `TEMPLATES_ROOT/../foo/...`
+    能读 / 写模板目录外的文件（覆盖出厂 PNG 让所有律师函用假章）
+  - 修复：新增 `_SLUG_VALID_RE = r"[A-Za-z0-9_-]{1,50}"` + `_valid_slug()`，
+    9 个入口都加了校验
+
+- **#4 · `/generate_one` 每次新启 Chromium + 无限流**
+  - 原代码：`render_notice_row_pdf(browser=None)` 每个请求 launch + close
+    一次浏览器（~1 s 纯启动税）；无并发限制
+  - 影响：用户感觉"点一下要 4 秒"；一个循环点就能把 2 GB VPS 打 OOM
+  - 修复：模块级 `_SHARED_SINGLE_BROWSER` 共享 Chromium（lazy + 线程锁），
+    `_SINGLE_GEN_SEM = threading.Semaphore(4)` 限并发 4，超过返 429
+  - 预期：单条生成 4 s → ~1 s
+
+- **#5 · `_render_security_overlay_png` / `_render_qr_png` 无缓存**
+  - 原代码：实时预览每 300 ms 一次 POST，每次重画 40+ 曲线 + 25 水印 tile
+    ≈ 80–200 ms Pillow CPU；批量 5000 行重复同配置也是 5000 次全量绘图
+  - 修复：`@functools.lru_cache(maxsize=64)` on overlay，key = `(json(config),
+    name, w, h)`；`@lru_cache(maxsize=256)` on QR，key = qr text
+  - 效果：同 config 改正文 textarea 预览几乎瞬变；批量生成里同名字符串的
+    QR 直接命中
+
+### 新增
+
+- **历史记录（audit log，SQLite）**
+  - 存 `uploads/history.db`，schema：
+    `(id, serial, name, principal, generated_at)` + 两个索引
+  - WAL 模式允许读写并发（`/verify` 读的时候 batch 仍在写）
+  - **容量上限 2,000,000 行**（约 200 MB），超了自动删最旧的行
+  - 每次成功渲染都记一条（batch 和 Manual 两个路径都 hook 了）
+  - 失败渲染不记录（`fut.result()` 先 raise 再跳过 log）
+
+- **`/verify` 页面 + `/api/verify` + `/api/history`**
+  - `GET /api/verify?serial=XXXX-XXXX-XXXX-XXXX` → `{ok, name, principal,
+    generated_at}` 或 404
+  - `GET /api/history?limit=&offset=&q=` → 分页列表，支持按姓名模糊搜
+  - `GET /verify` 是带 UI 的前端页：上面一个输入框按 Enter 验证，下面
+    一个可搜索 / 分页的最近历史表
+  - 工作流：律所收到一份可疑律师函 → 把 QR 下方 16 位序列号敲进 /verify
+    → 立即知道是否真实 + 给谁发的 + 什么时候发的
+
+### 变更
+
+- **依赖**：新增 `sqlite3`（stdlib）/ `hashlib`（stdlib）/ `functools`（stdlib）
+  —— 不需要改 `requirements.txt`
+- `render_notice_row_pdf` 签名未变，调用点加了一些 `_log_notice_record()`
+
+### 测试验证
+
+- 3 个独立 Python 进程跑 `_name_seed("Ali Hassan")` → **输出完全相同** ✓
+- `GET /api/templates/..` → 400 ✓；`/default` → 200 ✓
+- POST 预览带 `<script>alert(1)</script>` → 出现 `&lt;script&gt;alert(1)...`，
+  0 次原始 `<script>` ✓
+- 生成一条 "History Test" → `/api/verify?serial=67MX-4KPE-C9A9-YDE6` 返回
+  匹配的 name + principal + generated_at ✓
+- `/api/history?limit=5` 返回 total + rows ✓
+
 ## 2026-04-16 (品牌刷新)
 
 这一轮是视觉层的大改：换新 S&S 盾牌 logo、换 Muhammad Junaid Abbasi 的

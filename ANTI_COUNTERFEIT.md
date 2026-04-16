@@ -326,7 +326,7 @@ pdf.docinfo["/CreationDate"] = "D:" + now.strftime("%Y%m%d%H%M%S") + "Z"
 ## 9. 每文档唯一化（贯穿全栈）
 
 ### 核心思想
-**所有随机成分都用 `hash(name)` 作 RNG 种子**：
+**所有随机成分都用 `_name_seed(name)` 作 RNG 种子**：
 - 水印 tile 旋转、颜色微扰（第 1 层）
 - Guilloche 正弦相位、螺旋旋向、圆心坐标（第 2 层）
 - QR 序列号（第 4 层）
@@ -340,20 +340,106 @@ pdf.docinfo["/CreationDate"] = "D:" + now.strftime("%Y%m%d%H%M%S") + "Z"
 
 ### 代码位置
 ```python
+# 模块级稳定种子（hashlib.sha256 的前 8 字节）
+def _name_seed(name):
+    return int.from_bytes(
+        hashlib.sha256((name or "").encode("utf-8")).digest()[:8], "big")
+
 # build_notice_html
-srng = random.Random(hash(name) & 0xFFFFFFFF)
+srng = random.Random(_name_seed(name))
 firm_rot = srng.uniform(-15, 15)
 sig_rot  = srng.uniform(-15, 15)
 
 # generate_qr_serial
-srng = random.Random(hash(name) & 0xFFFFFFFF)
+srng = random.Random(_name_seed(name))
 
-# _render_security_overlay_png 内部同样通过 config + name 派生的 seed
+# _render_security_overlay_png 内部同样用 _name_seed(name)
 ```
+
+### ⚠ 历史注意事项
+**2026-04-16 之前**用的是 Python 的内置 `hash(name) & 0xFFFFFFFF`——这是 bug。
+Python 3 的 `hash()` 会用每个进程启动时随机生成的 salt（`PYTHONHASHSEED=random`
+默认），所以：
+- 服务重启一次，同一个人的序列号就变了 → 律所反查失败
+- ProcessPool 每个 worker 是独立 Python 进程 → 同一批次里不同 worker 生成
+  的律师函序列号不一致
+
+切换到 `hashlib.sha256` 后，种子跨进程、跨机器、跨 Python 版本全部一致。
+文档承诺的"同名复跑相同"从此才真正成立。
 
 ### 攻击场景
 - **Alice 把 Bob 的律师函当模板改**：水印里 Bob 的名字、QR 扫出 Bob 的名字、序列号对应 Bob 的哈希——三处无法同时用 Alice 的姓名配平
 - **暴力生成假律师函**：必须反推 `hash()`，实际不可行；而律所后台只需跑一次 `generate_qr_serial(真实姓名)` 即可验证
+
+---
+
+---
+
+## 10. 历史审计日志（`uploads/history.db`）
+
+### 目标
+给第 4 层（16 位序列号）加一个**真正的反查数据源**。之前文档说"律所后台
+跑 `generate_qr_serial(姓名)` 对比"——对，但需要知道正确的姓名才能对比。
+现在有了 SQLite 日志，律所可以**直接按序列号反查**姓名 + 金额 + 时间。
+
+### Schema
+
+```sql
+CREATE TABLE notice_history (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  serial       TEXT NOT NULL,          -- XXXX-XXXX-XXXX-XXXX
+  name         TEXT NOT NULL,          -- 被告姓名
+  principal    TEXT,                   -- Principal_Amount 字段
+  generated_at TEXT NOT NULL           -- ISO 8601 时间戳
+);
+CREATE INDEX idx_history_serial  ON notice_history(serial);
+CREATE INDEX idx_history_created ON notice_history(generated_at);
+```
+
+**只存四项**：序列号 / 姓名 / 本金 / 时间。不存客户隐私字段（CNIC、手机、
+交易号）——这些留在原始 Excel 里归律所自己保管。
+
+### 容量管理
+- `HISTORY_MAX_ROWS = 2_000_000`
+- 超过就删最旧的（按 `id ASC`）
+- 2M 行约 200 MB 磁盘，索引查询仍是 O(log N) ≈ 微秒级
+
+### 写入点
+每次**成功**渲染 PDF 都 hook 一条记录：
+- **Excel 批量**：`_process_group_html` 里 `fut.result()` 返回后 log，
+  失败的行（raise）不记录
+- **Manual 单条**：`/generate_one` 里 `render_notice_row_pdf` 返回后 log
+- SQLite WAL 模式允许读写并发（`/verify` 正在读的同时 worker 还能写）
+
+### 查询接口
+
+```
+GET /api/verify?serial=XXXX-XXXX-XXXX-XXXX
+→ 200 {ok: true, name, principal, generated_at}
+→ 404 {ok: false, error: "not found"}
+
+GET /api/history?limit=50&offset=0&q=张三
+→ 200 {total, limit, offset, rows: [{serial, name, principal, generated_at}]}
+```
+
+UI: `/verify` 页面（带 logo 的独立页）——上面一个大输入框，按 Enter 或
+点 Verify 立即返回；下面一个最近历史表，可按姓名模糊搜 + 分页。
+
+### 防伪价值
+- **真实性**：收到可疑律师函 → 敲序列号 → 库里找到 = 真实；找不到 = 伪造
+  或至少"不是本系统生成的"
+- **谁发的**：匹配记录直接显示当初发给谁、本金多少
+- **何时发的**：`generated_at` 精确到秒，可交叉 timestamps
+- **防内部纂改**：attacker 就算拿到 DB 写权限，改 name/principal 后序列号
+  也对不上——序列号是 `_name_seed(name)` 的派生，改 name 必然要重算 serial，
+  而原序列号已经**印在纸上了**。DB 和纸必须同时改。
+
+### 局限
+- 单机 SQLite，跨实例不共享。多律师楼部署要接外部数据库或复制 DB
+- 当前写入只有序列号 + 姓名 + 本金 + 时间。想追加更多字段需要改 schema
+  + 修 `_log_notice_record()`
+- 2M 容量到上限后 FIFO 丢弃，**不保留历史**——早期发的律师函几年后可能
+  已经无法反查。要永久保留需要调高 `HISTORY_MAX_ROWS` 或改成按年归档
 
 ---
 
