@@ -274,6 +274,8 @@ sudo bash deploy/setup.sh
 
 数据存 `uploads/history.db`（SQLite + WAL）。容量上限 2,000,000 条，超出自动 FIFO 删最旧。每次 Excel / Manual 生成成功都写一行（失败行不记录）。
 
+**完整的查询 API 规范（请求参数、响应字段、错误码、序列号格式、未来扩展预留、数据模型）见 [`INQUIRY_API.md`](INQUIRY_API.md)**——独立文档以便未来接入第三方系统（OA、移动 App、合作方核验服务）。
+
 ### 认证
 
 | 方法 | 路径 |
