@@ -1,0 +1,33 @@
+/* Bundled Google Fonts — no CDN at render time. */
+
+@font-face {
+  font-family: "Libre Baskerville";
+  src: url("/static/fonts/LibreBaskerville-Regular.ttf") format("truetype");
+  font-weight: 400; font-style: normal; font-display: block;
+}
+@font-face {
+  font-family: "Libre Baskerville";
+  src: url("/static/fonts/LibreBaskerville-Italic.ttf") format("truetype");
+  font-weight: 400; font-style: italic; font-display: block;
+}
+@font-face {
+  font-family: "Libre Baskerville";
+  src: url("/static/fonts/LibreBaskerville-Bold.ttf") format("truetype");
+  font-weight: 700; font-style: normal; font-display: block;
+}
+
+@font-face {
+  font-family: "Playfair Display";
+  src: url("/static/fonts/PlayfairDisplay-Regular.ttf") format("truetype");
+  font-weight: 400; font-style: normal; font-display: block;
+}
+@font-face {
+  font-family: "Playfair Display";
+  src: url("/static/fonts/PlayfairDisplay-Bold.ttf") format("truetype");
+  font-weight: 700; font-style: normal; font-display: block;
+}
+@font-face {
+  font-family: "Playfair Display";
+  src: url("/static/fonts/PlayfairDisplay-Black.ttf") format("truetype");
+  font-weight: 900; font-style: normal; font-display: block;
+}

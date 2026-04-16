@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Legal Notice — S&amp;S Law Firm</title>
+<link rel="stylesheet" href="/static/fonts.css">
+<style>
+  /* -------- page + type scale (print-first, A4) --------
+     Each legal notice is explicitly split into two self-contained
+     <div class="page"> elements. That way each printed page carries
+     its own complete double border — no relying on Chromium
+     correctly clipping a page-spanning element. */
+  @page { size: A4; margin: 0; }
+  html, body { margin: 0; padding: 0; background: #f4f1ea; }
+  body { font-family: "Libre Baskerville", Georgia, "Times New Roman", Times, serif;
+         color: #111; line-height: 1.55; font-size: 11pt; }
+  h1, h2, h3, .serif-heading { font-family: "Playfair Display", "Libre Baskerville", serif; }
+  em, i { font-style: italic; }
+  strong, b { font-weight: 700; }
+
+  .page {
+    position: relative;
+    width: 210mm;
+    height: 297mm;
+    /* bottom padding reserves space for the absolutely-positioned
+       .contact footer that repeats on every page */
+    padding: 18mm 24mm 26mm 24mm;
+    margin: 0 auto;
+    background: #fdfbf7;
+    box-sizing: border-box;
+    overflow: hidden;
+    page-break-inside: avoid;
+    outline: 2.6pt solid #111;
+    outline-offset: -10mm;
+    box-shadow: 0 0 40px rgba(0,0,0,.12);
+  }
+  .page + .page {
+    margin-top: 8mm;
+    page-break-before: always;  /* the 2nd page is its own printed sheet */
+  }
+  .page::before {
+    content: "";
+    position: absolute;
+    inset: 13mm;
+    border: 0.6pt solid #111;
+    pointer-events: none;
+  }
+  @media print {
+    body { background: transparent; }
+    .page { box-shadow: none; margin: 0 auto; }
+    .page + .page { margin-top: 0; }
+  }
+
+  /* -------- letterhead: logo left · partner list right --------- */
+  .letterhead {
+    display: grid;
+    grid-template-columns: 1fr 54mm;
+    gap: 10mm;
+    align-items: center;
+    margin-bottom: 2mm;
+  }
+  .brand { display: flex; flex-direction: column; align-items: flex-start; }
+  /* Logo: the source PNG has the gold shield + laurel + "S&S" lettering
+     re-centered on a black background. Clipped to a circle here, and
+     sized via CSS vars so users can tune per-template via sidebar. */
+  .brand .logo-wrap {
+    width: var(--logo-size, 22mm);
+    height: var(--logo-size, 22mm);
+    margin-bottom: 1mm;
+    overflow: hidden;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    transform: translate(var(--logo-dx, 0), var(--logo-dy, 0))
+               rotate(var(--logo-rot-base, 0deg));
+  }
+  .brand .logo-wrap img { width: 100%; height: 100%; object-fit: contain; }
+  .brand h1.firm {
+    font-size: 21pt; font-weight: 900; letter-spacing: -.02em;
+    line-height: 1; margin: 0; color: #0a0a0a;
+  }
+  .brand .tag { font-size: 9.5pt; font-style: italic; color: #333; margin-top: 0.3mm; }
+
+  .partners {
+    text-align: right;
+    font-size: 7.5pt;
+    font-style: italic;
+    line-height: 1.1;
+    background: transparent;
+    color: #2a2a2a;
+  }
+  .partners .person { margin-bottom: 0.8mm; }
+  .partners .name { font-style: normal; font-weight: 600; font-size: 8pt;
+                    color: #111; display: block; letter-spacing: .01em; }
+  .partners .role { color: #4a4a4a; }
+
+  /* -------- full-width bold rule under letterhead -------- */
+  hr.sep-thick {
+    border: 0; height: 1.6pt; background: #111;
+    margin: 2mm 0 3mm 0;
+  }
+
+  /* -------- LEGAL NOTICE title with double underline -------- */
+  .legal-title-wrap { text-align: center; margin: 1mm 0 4mm; }
+  h2.legal-title {
+    display: inline-block;
+    font-size: 19pt;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: .14em;
+    padding-bottom: 2mm;
+    border-bottom: 4pt double #111;
+    margin: 0;
+  }
+
+  /* -------- body base -------- */
+  .body { font-size: 10pt; line-height: 1.42; }
+  .body p { margin: 1.2mm 0; }
+  .body .block { margin-bottom: 3mm; }
+
+  /* -------- Metadata: grid so values align vertically -------- */
+  .meta {
+    display: grid;
+    grid-template-columns: max-content 6mm 1fr;
+    row-gap: 0.5mm;
+    column-gap: 0;
+    font-size: 10.5pt;
+  }
+  .meta .label { font-weight: 700; }
+  .meta .colon { font-weight: 700; text-align: left; }
+  .meta .value { }
+  .meta .to-row { grid-column: 1 / -1; font-weight: 700; margin-top: 1mm; }
+  .meta .date-row { grid-column: 1 / -1; margin-bottom: 1.5mm; font-weight: 600; }
+
+  /* -------- SUBJECT block: light gray strip -------- */
+  .subject {
+    background: #eceae5;
+    padding: 2mm 4mm;
+    margin: 3mm 0 3mm;
+    border-left: 3pt solid #111;
+    font-weight: 700;
+    text-transform: uppercase;
+    text-align: left;
+    letter-spacing: .02em;
+    line-height: 1.25;
+    font-size: 9.5pt;
+  }
+
+  /* -------- Body narrative -------- */
+  .narrative p { text-align: justify; hyphens: auto; }
+  .narrative em { font-style: italic; font-weight: 400; }  /* italic-only, per "≤3 bold" rule */
+
+  /* -------- Amounts as an invisible aligned table -------- */
+  table.amounts {
+    margin: 3mm 0 3mm 6mm;
+    border-collapse: collapse;
+    font-size: 11.5pt;
+  }
+  table.amounts td { padding: 0.6mm 0; vertical-align: top; }
+  table.amounts td.item { font-style: italic; padding-right: 8mm; }
+  table.amounts td.cur {
+    font-family: "Libre Baskerville", serif;
+    font-variant-numeric: tabular-nums;
+    padding-right: 3mm;
+  }
+  table.amounts td.amt {
+    font-family: ui-monospace, "SF Mono", "Menlo", "Consolas", monospace;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    min-width: 28mm;
+  }
+  table.amounts tr.total td.amt {
+    font-weight: 700; font-size: 13pt;
+    border-top: 0.5pt solid #999; padding-top: 1.2mm;
+  }
+
+  .callout-pay {
+    font-weight: 700;
+    margin-top: 2mm;
+    padding: 1mm 0;
+  }
+  .callout-pay .deadline { font-weight: 700; text-decoration: underline; }
+  .callout-pay .total-amt { font-weight: 700; }
+
+  /* -------- Consequences: numbered list -------- */
+  h3.consequences-heading {
+    font-weight: 700; text-decoration: underline;
+    font-size: 12pt;
+    margin: 6mm 0 2mm 0;
+    text-transform: uppercase;
+    letter-spacing: .02em;
+  }
+  ol.consequences {
+    counter-reset: conseq;
+    list-style: none;
+    padding-left: 0;
+    margin: 0;
+  }
+  ol.consequences > li {
+    counter-increment: conseq;
+    position: relative;
+    padding-left: 9mm;
+    margin: 2mm 0;
+    text-align: justify;
+  }
+  ol.consequences > li::before {
+    content: counter(conseq) ".";
+    position: absolute;
+    left: 0; top: 0;
+    font-weight: 700;
+    width: 7mm;
+  }
+
+  /* -------- Payment instructions -------- */
+  h3.payment-heading {
+    font-weight: 700; text-decoration: underline;
+    font-size: 11.5pt;
+    text-transform: uppercase;
+    margin: 6mm 0 2mm 0;
+    letter-spacing: .02em;
+  }
+  /* The firm seal is absolute-positioned relative to this block so
+     it anchors near the end of the payment instructions text. */
+  .block[data-purpose="payment-instructions"] { position: relative; }
+
+  /* -------- Footer signature area --------
+     Left: QR slot. Right: seal overlapping signature.
+     Plenty of vertical whitespace above (mt 16mm). */
+  .signature-row {
+    margin-top: 18mm;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    align-items: flex-end;
+    gap: 10mm;
+    page-break-inside: avoid;
+  }
+  .qr-slot {
+    width: 28mm; height: 28mm;
+    display: flex; align-items: flex-end; justify-content: flex-start;
+  }
+  .qr-slot img { width: 100%; height: 100%; object-fit: contain; }
+  .qr-slot .placeholder {
+    width: 100%; height: 100%;
+    border: 0.5pt dashed #999;
+    display: flex; align-items: center; justify-content: center;
+    color: #999; font-size: 8pt; letter-spacing: .08em;
+    text-transform: uppercase;
+  }
+
+  /* Two-column signature row — left: red firm seal + "Office Seal"
+     caption; right: printed signature with blue signature-seal overlay.
+     The QR code has moved out of this row to an absolute-positioned
+     slot anchored bottom-right of the page (.qr-footer-br). */
+  .signature-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    align-items: center;
+    gap: 8mm;
+  }
+
+  /* QR code + anti-counterfeit serial, anchored bottom-right of the
+     page: 1.5cm from the inner decorative border (inset 13mm from page
+     edge, so right:28mm = 13 + 15mm), 2cm above the contact-footer
+     divider line (which sits ~26mm up from page bottom, so bottom
+     ~46mm). */
+  .qr-footer-br {
+    position: absolute;
+    right: 28mm;
+    bottom: 46mm;
+    width: 28mm;
+    display: flex; flex-direction: column;
+    align-items: center;
+    gap: 2mm;
+    z-index: 2;
+  }
+  .qr-footer-br .qr-slot {
+    width: 28mm; height: 28mm;
+    justify-self: unset;
+  }
+  .qr-footer-br .qr-sn {
+    font-family: ui-monospace, "SF Mono", "Menlo", "Consolas", monospace;
+    font-size: 7.5pt;
+    font-weight: 600;
+    letter-spacing: 0.4pt;
+    color: #333;
+    white-space: nowrap;
+  }
+
+  /* Left column: firm seal anchored to the LEFT edge of its grid cell
+     then nudged +8mm to the right so it sits symmetrically opposite
+     the right-column stamp block (`justify-self: end`). Caption and
+     seal image stay centered on each other. */
+  .firm-seal-box {
+    justify-self: start;
+    margin-left: 8mm;
+    display: flex; flex-direction: column;
+    align-items: center; gap: 1mm;
+  }
+  /* Seal size / offset / base rotation come from per-template
+     assets_config (CSS vars). Per-document random rotation (--firm-rot)
+     from the security overlay is added on top of the base angle. */
+  .firm-seal-box .firm-seal {
+    width:  var(--seal-size, 22mm);
+    height: var(--seal-size, 22mm);
+    transform: translate(var(--seal-dx, 0), var(--seal-dy, 0))
+               rotate(calc(var(--seal-rot-base, 0deg) + var(--firm-rot, 0deg)));
+    opacity: .92;
+  }
+  .firm-seal-box .firm-seal-caption {
+    font-size: 9pt;
+    font-weight: 600;
+    text-decoration: underline;
+    color: #111;
+    letter-spacing: .02em;
+    white-space: nowrap;
+  }
+
+  /* Right-side signature block is now just the signature_seal image
+     (which already contains the handwritten signature + printed
+     partner name + role + blue "Muhammad Junaid Abbasi" stamp baked in).
+     No extra text is rendered alongside. */
+  .stamp-block {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    justify-self: end;
+    min-height: 30mm;
+  }
+  /* Signature-seal size / offset / base rotation come from per-template
+     assets_config (CSS vars). Per-document random rotation (--sig-rot)
+     from the security overlay is added on top of the base angle. */
+  .stamp-block .signature-seal {
+    width: var(--sig-size, 54mm);
+    transform: translate(var(--sig-dx, 0), var(--sig-dy, 0))
+               rotate(calc(var(--sig-rot-base, 0deg) + var(--sig-rot, 0deg)));
+    opacity: .92;
+    pointer-events: none;
+  }
+
+  /* -------- Bottom contact footer — pinned per page -------- */
+  .contact {
+    position: absolute;
+    left: 24mm; right: 24mm; bottom: 14mm;
+    padding-top: 2mm;
+    border-top: 0.8pt solid #333;
+    text-align: center;
+    font-size: 8.5pt;
+    color: #333;
+    line-height: 1.4;
+  }
+  .contact p { margin: 0.5mm 0; }
+  .contact .lbl { font-weight: 700; }
+</style>
+</head>
+<body>
+
+<main>
+
+<!-- ══════════════ PAGE 1 — Letterhead, title, metadata, subject, narrative ══════════════ -->
+<div class="page" data-page="1">
+
+  <header class="letterhead">
+    <div class="brand">
+      <div class="logo-wrap">
+        <img data-slot="logo" src="/static/images/logo.png" alt="S&amp;S Law Firm">
+      </div>
+      <div class="block" data-purpose="letterhead-firm">
+        <h1 class="firm">S&amp;S LAW FIRM</h1>
+        <div class="tag">Legal &amp; Corporate Consultant</div>
+      </div>
+    </div>
+    <aside class="partners">
+      <div class="block" data-purpose="letterhead-partners">
+        <div class="person"><span class="name">Muhammad Junaid Abbasi</span>
+          <span class="role">Adv High Court (Managing Partner)</span></div>
+        <div class="person"><span class="name">Khizar Ayoub Chaudhary</span>
+          <span class="role">Adv High Court</span></div>
+        <div class="person"><span class="name">Shahid Abbas Khokhar</span>
+          <span class="role">Adv High Court</span></div>
+        <div class="person"><span class="name">Raja Usman Hameed Abbasi</span>
+          <span class="role">Adv High Court</span></div>
+        <div class="person"><span class="name">Shabab Zahir</span>
+          <span class="role">Adv High Court</span></div>
+        <div class="person"><span class="name">Habibullah</span>
+          <span class="role">Adv High Court</span></div>
+      </div>
+    </aside>
+  </header>
+
+  <hr class="sep-thick">
+
+  <div class="legal-title-wrap">
+    <h2 class="legal-title">Legal Notice</h2>
+  </div>
+
+  <div class="body">
+    <!-- Metadata (date + TO: identity) -->
+    <div class="block" data-purpose="notice-metadata">
+      <div class="meta">
+        <div class="date-row"><strong>Date:</strong> {{date}}</div>
+        <div class="to-row">TO:</div>
+        <div class="label">Name</div><div class="colon">:</div><div class="value">{{name}}</div>
+        <div class="label">CNIC</div><div class="colon">:</div><div class="value">{{cnic}}</div>
+        <div class="label">Mobile</div><div class="colon">:</div><div class="value">{{phone}}</div>
+      </div>
+    </div>
+
+    <!-- Subject -->
+    <div class="block" data-purpose="notice-subject">
+      <div class="subject">
+        SUBJECT: FINAL LEGAL NOTICE FOR RECOVERY OF OUTSTANDING FINANCE
+        UNDER SECTIONS 3, 9, 15 &amp; 20 OF THE FINANCIAL INSTITUTIONS
+        (RECOVERY OF FINANCES) ORDINANCE, 2001
+      </div>
+    </div>
+
+    <!-- Narrative -->
+    <div class="block narrative" data-purpose="notice-body-text">
+      <p>Under instructions from our client,
+        <em class="client">M/s Zanda Financial Services (Pvt.) Limited</em>,
+        this FINAL LEGAL NOTICE is served upon you as follows:</p>
+
+      <p>That you availed a loan/finance facility through the
+        <em>MoneyTap Application</em> disbursed on {{disb_date}} under
+        agreed terms and conditions.</p>
+
+      <p>That as per agreed terms, the due date for repayment was
+        {{Due_date}}, which you have failed to honour.</p>
+
+      <p>That an amount comprising the following:</p>
+
+      <table class="amounts">
+        <tr><td class="item">Principal</td><td class="cur">PKR</td>
+            <td class="amt">{{Principal_Amount}}</td></tr>
+        <tr><td class="item">Interest</td><td class="cur">PKR</td>
+            <td class="amt">{{Interest}}</td></tr>
+        <tr><td class="item">Penalty</td><td class="cur">PKR</td>
+            <td class="amt">{{Penalty}}</td></tr>
+        <tr class="total"><td class="item">Total payable</td>
+            <td class="cur">PKR</td>
+            <td class="amt">{{Payable}}</td></tr>
+      </table>
+      <p>is now outstanding, bringing the total payable to
+         PKR <span class="total-amt">{{Payable}}</span>.</p>
+
+      <p><strong>Transaction history:</strong><br>
+        Transaction ID, <em>{{Transaction_id}}</em>, and EasyPaisa
+        account number: <em>{{easypaisa_account}}</em>.</p>
+
+      <p>That despite repeated reminders, you have willfully evaded
+        payment, reflecting mala fide intention and unlawful retention
+        of funds.</p>
+
+      <p class="callout-pay">You are hereby finally called upon to pay
+        PKR <span class="total-amt">{{Payable}}</span> within
+        <span class="deadline">03 (three) days</span> from receipt of
+        this notice.</p>
+    </div>
+  </div>
+
+  <!-- Page footer — repeated on every page -->
+  <div class="contact" data-purpose="page-footer">
+    <p><span class="lbl">Office:</span> Plot# 81, I&amp;T Center, G-9/4 Islamabad.
+       &nbsp;|&nbsp; <span class="lbl">Email:</span> sandslawfirm3187@gmail.com</p>
+    <p><span class="lbl">Phone:</span> +92 303 9175939 &nbsp;|&nbsp; +92 333 5649275</p>
+  </div>
+
+</div> <!-- /page 1 -->
+
+
+<!-- ══════════════ PAGE 2 — Consequences, payment, signature, footer ══════════════ -->
+<div class="page" data-page="2">
+
+  <div class="body page2-body">
+    <!-- Consequences (numbered) -->
+    <div class="block" data-purpose="legal-consequences">
+      <h3 class="consequences-heading">LEGAL CONSEQUENCES IN CASE OF NON-COMPLIANCE</h3>
+      <ol class="consequences">
+        <li>Initiation of recovery proceedings before the competent
+            Banking Court under Sections 9, 15 and 20 of the Financial
+            Institutions (Recovery of Finances) Ordinance, 2001.</li>
+        <li>Attachment, garnishee, and freezing of your bank accounts,
+            assets, and properties under the relevant provisions of law.</li>
+        <li>Application before the competent forum for directions to
+            NADRA for blocking/suspension of CNIC, subject to court
+            orders.</li>
+        <li>In case any misrepresentation, fraudulent activity, or
+            concealment of material facts is found, our client shall
+            initiate legal proceedings, including filing of a complaint
+            and registration of FIR under Clause (b) of Section 20 of
+            the Financial Institutions (Recovery of Finances)
+            Ordinance, 2001, at your sole risk and cost.</li>
+        <li>Recovery of full litigation costs, legal expenses, markup,
+            damages, and any other relief available under law.</li>
+      </ol>
+    </div>
+
+    <!-- Payment instructions -->
+    <div class="block" data-purpose="payment-instructions">
+      <h3 class="payment-heading">PAYMENT INSTRUCTIONS</h3>
+      <p>Payment shall be made through the same mobile application
+        (<em>MoneyTap App</em>) through which the loan facility was
+        originally availed.</p>
+      <p>This is your FINAL AND LAST OPPORTUNITY to settle the matter
+        amicably. Failure to comply will result in strict legal action
+        at your sole risk and cost.</p>
+      <p>For any query, you may contact: 0303-9175939 | 0309-0548645.
+        For and on behalf of the Client.</p>
+    </div>
+  </div>
+
+  <!-- ── SIGNATURE ROW: two columns ──
+       left  : red firm seal + "Office Seal" underlined caption
+       right : printed signature with blue signature-seal overlay
+       (QR code has moved to .qr-footer-br below, anchored bottom-right) -->
+  <div class="signature-row">
+    <div class="firm-seal-box">
+      <img class="firm-seal" data-slot="seal"
+           src="/static/images/seal_default.png" alt="Office Seal">
+      <div class="firm-seal-caption">Office Seal</div>
+    </div>
+    <div class="stamp-block">
+      <img class="signature-seal" data-slot="signature_seal"
+           src="/static/images/signature_seal_default.png" alt="Signature Seal">
+    </div>
+  </div>
+
+  <!-- ── QR + anti-counterfeit serial: absolute bottom-right ── -->
+  <div class="qr-footer-br">
+    <div class="qr-slot" data-slot="qr">
+      <div class="placeholder">QR</div>
+    </div>
+    <div class="qr-sn">__QR_SN__</div>
+  </div>
+
+  <!-- ── CONTACT FOOTER ── -->
+  <div class="contact" data-purpose="page-footer">
+    <p><span class="lbl">Office:</span> Plot# 81, I&amp;T Center, G-9/4 Islamabad.
+       &nbsp;|&nbsp; <span class="lbl">Email:</span> sandslawfirm3187@gmail.com</p>
+    <p><span class="lbl">Phone:</span> +92 303 9175939 &nbsp;|&nbsp; +92 333 5649275</p>
+  </div>
+
+</div> <!-- /page 2 -->
+
+</main>
+
+</body>
+</html>

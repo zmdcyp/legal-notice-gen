@@ -16,7 +16,13 @@ echo "================================================"
 # 1. 安装系统依赖
 echo "[1/6] 安装系统依赖..."
 apt-get update -qq
-apt-get install -y python3 python3-pip python3-venv nginx libreoffice-writer fonts-wqy-zenhei fonts-wqy-microhei > /dev/null
+apt-get install -y python3 python3-pip python3-venv nginx \
+    fonts-wqy-zenhei fonts-wqy-microhei \
+    fonts-dejavu-core fonts-noto-core fonts-noto-nastaliq-urdu \
+    libjpeg-dev zlib1g-dev > /dev/null
+
+# Playwright needs a pile of shared libs for headless Chromium. `playwright
+# install-deps` pulls the right apt packages for the current distro.
 
 # 2. 创建应用用户
 echo "[2/6] 创建应用用户..."
@@ -35,6 +41,9 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -q --upgrade pip
 pip install -q -r requirements.txt gunicorn
+# Download Chromium used for HTML→PDF rendering (~170 MB) into the venv.
+playwright install-deps chromium
+playwright install chromium
 deactivate
 
 mkdir -p "$APP_DIR/uploads"

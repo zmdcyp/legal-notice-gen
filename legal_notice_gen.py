@@ -25,6 +25,10 @@ Single-file delivery:
 import os
 import re
 import io
+import json
+import math
+import base64
+import random
 import zipfile
 import uuid
 import shutil
@@ -35,20 +39,37 @@ import threading
 import traceback
 import concurrent.futures
 import time
+import html as _htmllib
 from collections import defaultdict
 
 from flask import (Flask, request, send_file, jsonify, session,
-                   Response, after_this_request, redirect)
+                   Response, after_this_request, redirect, send_from_directory)
 import hmac as _hmac
-from docx import Document
 import openpyxl
+
+# ── security overlay deps (watermark + guilloche + QR) ─────────
+# These are optional: if any are unavailable the overlay features are
+# silently skipped so the tool still renders plain DOCX/PDFs.
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    import qrcode
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+    _SECURITY_DEPS_OK = True
+except ImportError:
+    _SECURITY_DEPS_OK = False
 
 # ── app setup ───────────────────────────────────────────────────
 
-app = Flask(__name__)
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+
+# Point Flask's built-in /static route at templates/static so the base
+# HTML template's absolute paths (/static/fonts.css, /static/images/...)
+# resolve inside the app without a separate http.server.
+app = Flask(__name__,
+            static_folder=os.path.join(BASE_DIR, "templates", "static"),
+            static_url_path="/static")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # Persist secret_key across restarts so /upload -> /generate sessions survive.
@@ -78,7 +99,7 @@ _AUTH_EXEMPT_PATHS = {"/login", "/logout"}
 
 # API endpoints return JSON 401 instead of redirecting, so the fetch() calls
 # on the front-end don't silently follow a redirect to HTML.
-_AUTH_API_PREFIXES = ("/upload", "/generate", "/status", "/download")
+_AUTH_API_PREFIXES = ("/upload", "/generate", "/status", "/download", "/api/")
 
 # ── machine profiles ────────────────────────────────────────────
 #
@@ -94,16 +115,12 @@ _CPU = os.cpu_count() or 4
 
 MACHINE_PROFILES = {
     "vps": {
-        "render_workers":  2,
-        "convert_workers": 2,
-        "pdf_chunk_size":  15,
-        "label": "VPS (conservative)",
+        "render_workers":  1,    # 1 Chromium ≈ 250 MB RAM — safe on small VPS
+        "label": "VPS (1 Chromium worker)",
     },
     "mac": {
-        "render_workers":  _CPU,
-        "convert_workers": _CPU,
-        "pdf_chunk_size":  10,
-        "label": "Mac (max perf)",
+        "render_workers":  min(_CPU, 6),
+        "label": f"Mac (up to {min(_CPU, 6)} Chromium workers)",
     },
 }
 DEFAULT_MACHINE = "vps"
@@ -115,8 +132,589 @@ def _get_machine_profile(name):
 
 # soffice timeout: generous per-file allowance with a floor so small batches
 # don't time out prematurely.
-SOFFICE_TIMEOUT_PER_FILE = 15
-SOFFICE_TIMEOUT_MIN = 180
+
+
+# ── template storage ─────────────────────────────────────────────
+#
+# Single built-in base template with 5 data-purpose blocks. The 4
+# user-editable blocks (subject / body-text / consequences / payment) are
+# stored as PLAIN TEXT. Rendering to HTML happens per-block in
+# `BLOCK_RENDERERS` — each renderer wraps paragraphs in the right tags
+# (<p>, <li>, etc.) and re-applies inline formatting (italic/bold/etc.)
+# to known phrases via `FORMAT_RULES`. This guarantees consistent
+# formatting regardless of what the user types, and keeps the editor
+# UI a simple plain-text textarea per block.
+#
+# Directory layout for saved templates:
+#   uploads/templates/<slug>/
+#     meta.json     {name, created, updated}
+#     blocks.json   {notice-subject: "...", notice-body-text: "...", ...}
+#     assets/
+#       logo.png        (optional per-template override)
+#       seal.png        (optional per-template override)
+#       signature.png   (optional per-template override)
+# The built-in "default" template lives in code (DEFAULT_BLOCKS_TEXT)
+# and uses the PNGs shipped at templates/static/images/.
+
+TEMPLATES_ROOT = os.path.join(UPLOAD_DIR, "templates")
+os.makedirs(TEMPLATES_ROOT, exist_ok=True)
+
+TEMPLATE_BASE_DIR = os.path.join(BASE_DIR, "templates")
+TEMPLATE_BASE_HTML_PATH = os.path.join(TEMPLATE_BASE_DIR, "legal_notice_full.html")
+TEMPLATE_STATIC_DIR = os.path.join(TEMPLATE_BASE_DIR, "static")
+
+EDITABLE_PURPOSES = (
+    "letterhead-firm",
+    "letterhead-partners",
+    "notice-subject",
+    "notice-body-text",
+    "legal-consequences",
+    "payment-instructions",
+    "page-footer",
+)
+
+# The amounts table is fixed structure; user references it from the body
+# text via this marker so they never edit HTML.
+BODY_TABLE_MARKER = "[[AMOUNTS_TABLE]]"
+# The callout-pay paragraph is the prominent bold "called upon to pay"
+# line. The next non-marker paragraph after [[CALLOUT]] gets the
+# callout-pay class.
+BODY_CALLOUT_MARKER = "[[CALLOUT]]"
+
+AMOUNTS_TABLE_HTML = (
+    '<table class="amounts">\n'
+    '  <tr><td class="item">Principal</td><td class="cur">PKR</td>'
+    '<td class="amt">{{Principal_Amount}}</td></tr>\n'
+    '  <tr><td class="item">Interest</td><td class="cur">PKR</td>'
+    '<td class="amt">{{Interest}}</td></tr>\n'
+    '  <tr><td class="item">Penalty</td><td class="cur">PKR</td>'
+    '<td class="amt">{{Penalty}}</td></tr>\n'
+    '  <tr class="total"><td class="item">Total payable</td>'
+    '<td class="cur">PKR</td><td class="amt">{{Payable}}</td></tr>\n'
+    '</table>'
+)
+
+
+DEFAULT_BLOCKS_TEXT = {
+    "letterhead-firm": (
+        "S&S LAW FIRM\n"
+        "Legal & Corporate Consultant"
+    ),
+    "letterhead-partners": (
+        "Muhammad Junaid Abbasi | Adv High Court (Managing Partner)\n"
+        "Khizar Ayoub Chaudhary | Adv High Court\n"
+        "Shahid Abbas Khokhar | Adv High Court\n"
+        "Raja Usman Hameed Abbasi | Adv High Court\n"
+        "Shabab Zahir | Adv High Court\n"
+        "Habibullah | Adv High Court"
+    ),
+    "page-footer": (
+        "Office: Plot# 81, I&T Center, G-9/4 Islamabad. "
+        "| Email: sandslawfirm3187@gmail.com\n"
+        "Phone: +92 303 9175939 | +92 333 5649275"
+    ),
+    "notice-subject": (
+        "SUBJECT: FINAL LEGAL NOTICE FOR RECOVERY OF OUTSTANDING FINANCE "
+        "UNDER SECTIONS 3, 9, 15 & 20 OF THE FINANCIAL INSTITUTIONS "
+        "(RECOVERY OF FINANCES) ORDINANCE, 2001"
+    ),
+    "notice-body-text": (
+        "Under instructions from our client, M/s Zanda Financial Services (Pvt.) Limited, "
+        "this FINAL LEGAL NOTICE is served upon you as follows:\n\n"
+        "That you availed a loan/finance facility through the MoneyTap Application "
+        "disbursed on {{disb_date}} under agreed terms and conditions.\n\n"
+        "That as per agreed terms, the due date for repayment was {{Due_date}}, "
+        "which you have failed to honour.\n\n"
+        "That an amount comprising the following:\n\n"
+        "[[AMOUNTS_TABLE]]\n\n"
+        "is now outstanding, bringing the total payable to PKR {{Payable}}.\n\n"
+        "Transaction history:\n"
+        "Transaction ID, {{Transaction_id}}, and EasyPaisa account number: {{easypaisa_account}}.\n\n"
+        "That despite repeated reminders, you have willfully evaded payment, "
+        "reflecting mala fide intention and unlawful retention of funds.\n\n"
+        "[[CALLOUT]]\n\n"
+        "You are hereby finally called upon to pay PKR {{Payable}} within "
+        "03 (three) days from receipt of this notice."
+    ),
+    "legal-consequences": (
+        "Initiation of recovery proceedings before the competent Banking Court "
+        "under Sections 9, 15 and 20 of the Financial Institutions "
+        "(Recovery of Finances) Ordinance, 2001.\n"
+        "Attachment, garnishee, and freezing of your bank accounts, assets, "
+        "and properties under the relevant provisions of law.\n"
+        "Application before the competent forum for directions to NADRA for "
+        "blocking/suspension of CNIC, subject to court orders.\n"
+        "In case any misrepresentation, fraudulent activity, or concealment "
+        "of material facts is found, our client shall initiate legal proceedings, "
+        "including filing of a complaint and registration of FIR under Clause (b) "
+        "of Section 20 of the Financial Institutions (Recovery of Finances) "
+        "Ordinance, 2001, at your sole risk and cost.\n"
+        "Recovery of full litigation costs, legal expenses, markup, damages, "
+        "and any other relief available under law."
+    ),
+    "payment-instructions": (
+        "Payment shall be made through the same mobile application (MoneyTap App) "
+        "through which the loan facility was originally availed.\n\n"
+        "This is your FINAL AND LAST OPPORTUNITY to settle the matter amicably. "
+        "Failure to comply will result in strict legal action at your sole risk and cost.\n\n"
+        "For any query, you may contact: 0303-9175939 | 0309-0548645. "
+        "For and on behalf of the Client."
+    ),
+}
+
+
+# Per-block phrase-to-tag mapping. After block renderer emits HTML, scan
+# for these phrases and wrap them. Longest phrases first so a shorter
+# phrase that's a substring doesn't "steal" the match.
+FORMAT_RULES = {
+    "notice-body-text": [
+        ('em class="client"', "M/s Zanda Financial Services (Pvt.) Limited"),
+        ("em",                "MoneyTap Application"),
+        ("em",                "{{Transaction_id}}"),
+        ("em",                "{{easypaisa_account}}"),
+        ('span class="total-amt"', "{{Payable}}"),
+        ('span class="deadline"',  "03 (three) days"),
+    ],
+    "payment-instructions": [
+        ("em", "MoneyTap App"),
+    ],
+    "page-footer": [
+        ('span class="lbl"', "Office:"),
+        ('span class="lbl"', "Email:"),
+        ('span class="lbl"', "Phone:"),
+    ],
+}
+
+
+def _esc_text(text):
+    """HTML-escape but keep placeholders ({{...}}) readable as-is (they
+    will be substituted at render time with already-safe values)."""
+    return _htmllib.escape(text, quote=False)
+
+
+def _apply_format_rules(html_fragment, purpose):
+    """Wrap each configured phrase with the configured tag. Phrases are
+    matched verbatim (case-sensitive) on the already-escaped HTML; the
+    phrase list is ordered longest-first to avoid nested-match mishaps."""
+    for tag_spec, phrase in FORMAT_RULES.get(purpose, ()):
+        tag_name = tag_spec.split(" ", 1)[0]
+        html_fragment = html_fragment.replace(
+            phrase, f"<{tag_spec}>{phrase}</{tag_name}>")
+    return html_fragment
+
+
+def _render_subject(text):
+    body = _apply_format_rules(_esc_text(text.strip()), "notice-subject")
+    return f'<div class="subject">{body}</div>'
+
+
+def _render_body_text(text):
+    """[[AMOUNTS_TABLE]] becomes the fixed amounts table. [[CALLOUT]] on
+    its own line flags the NEXT paragraph as `callout-pay`. All other
+    paragraphs are wrapped in <p>. Single newlines inside a paragraph
+    become <br> so multi-line items like "Transaction history:\\nid, X"
+    render as one paragraph with a line break."""
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    out = []
+    callout_next = False
+    for para in paragraphs:
+        if para == BODY_TABLE_MARKER:
+            out.append(AMOUNTS_TABLE_HTML)
+            continue
+        if para == BODY_CALLOUT_MARKER:
+            callout_next = True
+            continue
+        escaped = _esc_text(para).replace("\n", "<br>\n")
+        escaped = _apply_format_rules(escaped, "notice-body-text")
+        cls = ' class="callout-pay"' if callout_next else ""
+        out.append(f"<p{cls}>{escaped}</p>")
+        callout_next = False
+    return "\n".join(out)
+
+
+def _render_consequences(text):
+    items = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    lis = "\n".join(f"<li>{_esc_text(x)}</li>" for x in items)
+    return (
+        '<h3 class="consequences-heading">LEGAL CONSEQUENCES IN CASE OF NON-COMPLIANCE</h3>\n'
+        f'<ol class="consequences">\n{lis}\n</ol>'
+    )
+
+
+def _render_payment(text):
+    paras = [p.strip() for p in text.split("\n\n") if p.strip()]
+    ps = []
+    for p in paras:
+        esc = _esc_text(p).replace("\n", "<br>\n")
+        esc = _apply_format_rules(esc, "payment-instructions")
+        ps.append(f"<p>{esc}</p>")
+    return (
+        '<h3 class="payment-heading">PAYMENT INSTRUCTIONS</h3>\n'
+        + "\n".join(ps)
+    )
+
+
+def _render_letterhead_firm(text):
+    """Line 1 → firm h1 heading; line 2+ → italic tag below. Extra lines
+    after the 2nd get joined with <br> into the same tag line."""
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    if not lines:
+        return ""
+    firm = _esc_text(lines[0])
+    tag_html = ""
+    if len(lines) > 1:
+        tag = "<br>".join(_esc_text(ln) for ln in lines[1:])
+        tag_html = f'<div class="tag">{tag}</div>'
+    return f'<h1 class="firm">{firm}</h1>\n{tag_html}'
+
+
+def _render_letterhead_partners(text):
+    """Each non-empty line is one partner. Format: 'Name | Role'.
+    If no '|' is present the whole line is treated as the name."""
+    out = []
+    for ln in text.split("\n"):
+        ln = ln.strip()
+        if not ln:
+            continue
+        if "|" in ln:
+            name, role = ln.split("|", 1)
+            name_html = _esc_text(name.strip())
+            role_html = _esc_text(role.strip())
+        else:
+            name_html = _esc_text(ln)
+            role_html = ""
+        if role_html:
+            out.append(
+                f'<div class="person"><span class="name">{name_html}</span>'
+                f'<span class="role">{role_html}</span></div>')
+        else:
+            out.append(
+                f'<div class="person"><span class="name">{name_html}</span></div>')
+    return "\n".join(out)
+
+
+def _render_page_footer(text):
+    """Each non-empty line → <p>. Known labels (Office:/Email:/Phone:)
+    are wrapped with <span class='lbl'> via FORMAT_RULES."""
+    out = []
+    for ln in text.split("\n"):
+        ln = ln.strip()
+        if not ln:
+            continue
+        esc = _esc_text(ln)
+        esc = _apply_format_rules(esc, "page-footer")
+        out.append(f"<p>{esc}</p>")
+    return "\n".join(out)
+
+
+BLOCK_RENDERERS = {
+    "letterhead-firm":      _render_letterhead_firm,
+    "letterhead-partners":  _render_letterhead_partners,
+    "notice-subject":       _render_subject,
+    "notice-body-text":     _render_body_text,
+    "legal-consequences":   _render_consequences,
+    "payment-instructions": _render_payment,
+    "page-footer":          _render_page_footer,
+}
+
+
+def render_blocks_to_html(blocks_text):
+    """Return {purpose: html_fragment} from {purpose: plain_text}."""
+    out = {}
+    for purpose in EDITABLE_PURPOSES:
+        text = blocks_text.get(purpose, DEFAULT_BLOCKS_TEXT.get(purpose, ""))
+        out[purpose] = BLOCK_RENDERERS[purpose](text)
+    return out
+
+
+# ── saved-template CRUD ──
+
+_SLUG_RE = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def _slugify(name):
+    s = _SLUG_RE.sub("-", (name or "").strip()).strip("-").lower()
+    return s[:50] or "template"
+
+
+def list_templates():
+    """Return all templates — built-in default first, then saved ones."""
+    out = [{
+        "slug": "default",
+        "name": "S&S Law Firm — Default",
+        "builtin": True,
+        "created": None,
+        "updated": None,
+    }]
+    if os.path.isdir(TEMPLATES_ROOT):
+        for slug in sorted(os.listdir(TEMPLATES_ROOT)):
+            meta_path = os.path.join(TEMPLATES_ROOT, slug, "meta.json")
+            if os.path.isfile(meta_path):
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    out.append({
+                        "slug": slug,
+                        "name": meta.get("name", slug),
+                        "builtin": False,
+                        "created": meta.get("created"),
+                        "updated": meta.get("updated"),
+                    })
+                except (OSError, json.JSONDecodeError):
+                    pass
+    return out
+
+
+ASSET_KINDS = ("logo", "seal", "signature_seal")
+
+# Default per-asset placement: size (mm), horizontal/vertical offset from
+# the default anchor (mm), and user-set base rotation (degrees). These
+# defaults reproduce the baseline CSS numbers in templates/legal_notice_full.html.
+# The per-document random rotation from the security overlay is applied
+# ON TOP of the user-set base rotation (seal / signature_seal).
+DEFAULT_ASSETS_CONFIG = {
+    "logo":           {"size": 22, "dx": 0, "dy": 0, "rot": 0},
+    "seal":           {"size": 22, "dx": 0, "dy": 0, "rot": 0},
+    # signature_seal PNG is a square 1000×1000 containing the handwritten
+    # signature + printed partner name + role baked in, so the width is
+    # also the full block height. 44mm leaves enough room above the page
+    # footer line and keeps the signature comparable in scale to the
+    # 22mm office seal on the left.
+    "signature_seal": {"size": 44, "dx": 0, "dy": 0, "rot": 0},
+}
+
+
+def _merge_assets_config(user_cfg):
+    """Fill any missing per-kind values from DEFAULT_ASSETS_CONFIG and
+    coerce numeric types. Tolerates partial user overrides."""
+    out = {}
+    for kind in ASSET_KINDS:
+        base = DEFAULT_ASSETS_CONFIG[kind]
+        u = (user_cfg or {}).get(kind) or {}
+        try:
+            out[kind] = {
+                "size": float(u.get("size", base["size"])),
+                "dx":   float(u.get("dx",   base["dx"])),
+                "dy":   float(u.get("dy",   base["dy"])),
+                "rot":  float(u.get("rot",  base["rot"])),
+            }
+        except (TypeError, ValueError):
+            out[kind] = dict(base)
+    return out
+
+
+def _read_template_dir(slug):
+    """Read on-disk overrides (blocks, assets, security, assets_config,
+    meta) for a slug from uploads/templates/<slug>/. Missing files return
+    empty defaults; this helper is shared by load_template for both the
+    built-in default and user-saved templates."""
+    dir_path = os.path.join(TEMPLATES_ROOT, slug)
+    out = {"blocks": {}, "assets": {}, "security": None,
+           "assets_config": None,
+           "name": None, "created": None, "updated": None}
+    if not os.path.isdir(dir_path):
+        return out
+    for fname, key in [("blocks.json", "blocks"),
+                       ("security.json", "security"),
+                       ("assets_config.json", "assets_config"),
+                       ("meta.json", "meta")]:
+        p = os.path.join(dir_path, fname)
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if key == "meta":
+                    out["name"] = data.get("name")
+                    out["created"] = data.get("created")
+                    out["updated"] = data.get("updated")
+                else:
+                    out[key] = data
+            except (OSError, json.JSONDecodeError):
+                pass
+    assets_dir = os.path.join(dir_path, "assets")
+    for kind in ASSET_KINDS:
+        p = os.path.join(assets_dir, f"{kind}.png")
+        if os.path.isfile(p):
+            out["assets"][kind] = p
+    return out
+
+
+def load_template(slug):
+    """Return {slug, name, blocks, assets, assets_config, security, builtin}
+    or None.
+
+    For 'default' we start from the built-in hardcoded blocks/security
+    and overlay any on-disk overrides under uploads/templates/default/.
+    For any other slug we load straight from disk.
+    """
+    if slug == "default":
+        disk = _read_template_dir("default")
+        blocks = dict(DEFAULT_BLOCKS_TEXT)
+        blocks.update({p: v for p, v in (disk["blocks"] or {}).items()
+                       if p in EDITABLE_PURPOSES})
+        return {
+            "slug": "default",
+            "name": disk["name"] or "S&S Law Firm — Default",
+            "blocks": blocks,
+            "assets": disk["assets"],
+            "assets_config": _merge_assets_config(disk["assets_config"]),
+            "security": _merge_security_config(disk["security"])
+                        if disk["security"] else load_default_security(),
+            "builtin": True,
+        }
+    disk = _read_template_dir(slug)
+    if not disk["blocks"]:
+        return None
+    return {
+        "slug": slug,
+        "name": disk["name"] or slug,
+        "blocks": {p: (disk["blocks"].get(p) or DEFAULT_BLOCKS_TEXT.get(p, ""))
+                   for p in EDITABLE_PURPOSES},
+        "assets": disk["assets"],
+        "assets_config": _merge_assets_config(disk["assets_config"]),
+        "security": _merge_security_config(disk["security"])
+                    if disk["security"] else load_default_security(),
+        "builtin": False,
+    }
+
+
+def save_template(name, blocks=None, security=None, assets_config=None,
+                  overwrite_slug=None):
+    """Persist blocks / security / assets_config / name under a slug.
+
+    - If `overwrite_slug` is given and the dir exists (or overwrite_slug
+      == 'default'), update in place.
+    - Otherwise allocate a fresh slug derived from `name`; append -2,-3…
+      if one already exists with that base.
+    - `blocks` / `security` / `assets_config` may be None to keep
+      existing values.
+    """
+    if overwrite_slug == "default":
+        slug = "default"
+    else:
+        base = _slugify(name or "template")
+        if base == "default":
+            base = "template"
+        slug = overwrite_slug or base
+        dir_path = os.path.join(TEMPLATES_ROOT, slug)
+        if overwrite_slug is None:
+            n = 1
+            while os.path.isdir(dir_path):
+                n += 1
+                slug = f"{base}-{n}"
+                dir_path = os.path.join(TEMPLATES_ROOT, slug)
+
+    dir_path = os.path.join(TEMPLATES_ROOT, slug)
+    os.makedirs(dir_path, exist_ok=True)
+    os.makedirs(os.path.join(dir_path, "assets"), exist_ok=True)
+
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    meta_path = os.path.join(dir_path, "meta.json")
+    created = now
+    existing_name = None
+    if os.path.isfile(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                m = json.load(f)
+            created = m.get("created", now)
+            existing_name = m.get("name")
+        except (OSError, json.JSONDecodeError):
+            pass
+    meta = {
+        "name": name or existing_name
+                 or ("S&S Law Firm — Default" if slug == "default" else slug),
+        "created": created,
+        "updated": now,
+    }
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+
+    if blocks is not None:
+        # Merge with existing on-disk blocks so we never lose sections.
+        existing_blocks = _read_template_dir(slug)["blocks"]
+        merged_blocks = dict(existing_blocks)
+        for p in EDITABLE_PURPOSES:
+            if p in blocks:
+                merged_blocks[p] = blocks[p]
+        with open(os.path.join(dir_path, "blocks.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(merged_blocks, f, indent=2, ensure_ascii=False)
+
+    if security is not None:
+        merged = _merge_security_config(security)
+        with open(os.path.join(dir_path, "security.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(merged, f, indent=2, ensure_ascii=False)
+
+    if assets_config is not None:
+        merged_ac = _merge_assets_config(assets_config)
+        with open(os.path.join(dir_path, "assets_config.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(merged_ac, f, indent=2, ensure_ascii=False)
+    return slug
+
+
+def delete_template(slug):
+    if slug == "default":
+        raise ValueError("cannot delete the built-in default template")
+    dir_path = os.path.join(TEMPLATES_ROOT, slug)
+    if not os.path.isdir(dir_path):
+        return False
+    shutil.rmtree(dir_path)
+    return True
+
+
+def save_template_asset(slug, kind, uploaded_file):
+    """Store an uploaded PNG as <slug>/assets/<kind>.png. Works for
+    any slug including 'default' — overrides the shipped defaults."""
+    if kind not in ASSET_KINDS:
+        raise ValueError(
+            f"unknown asset kind: {kind!r} "
+            f"(valid: {', '.join(ASSET_KINDS)})")
+    dir_path = os.path.join(TEMPLATES_ROOT, slug, "assets")
+    os.makedirs(dir_path, exist_ok=True)
+    out_path = os.path.join(dir_path, f"{kind}.png")
+    uploaded_file.save(out_path)
+    return out_path
+
+
+def delete_template_asset(slug, kind):
+    """Remove a per-template asset override (revert to shipped default)."""
+    if kind not in ASSET_KINDS:
+        raise ValueError(f"unknown asset kind: {kind!r}")
+    p = os.path.join(TEMPLATES_ROOT, slug, "assets", f"{kind}.png")
+    if os.path.isfile(p):
+        os.remove(p)
+        return True
+    return False
+
+
+# ── security config store (for default template) ─────────────────
+#
+# The built-in default template doesn't own a meta.json; its security
+# overrides live here so users can iterate in the /editor without
+# promoting to a named saved template.
+
+_DEFAULT_SECURITY_FILE = os.path.join(UPLOAD_DIR, "default_security.json")
+
+
+def load_default_security():
+    """Return the stored security config for the default template, or
+    the baseline DEFAULT_SECURITY_CONFIG if nothing has been saved yet."""
+    if os.path.isfile(_DEFAULT_SECURITY_FILE):
+        try:
+            with open(_DEFAULT_SECURITY_FILE, "r", encoding="utf-8") as f:
+                return _merge_security_config(json.load(f))
+        except (OSError, json.JSONDecodeError):
+            pass
+    return _merge_security_config(None)
+
+
+def save_default_security(config):
+    merged = _merge_security_config(config)
+    with open(_DEFAULT_SECURITY_FILE, "w", encoding="utf-8") as f:
+        json.dump(merged, f, indent=2, ensure_ascii=False)
+    return merged
 
 
 # ── task registry ────────────────────────────────────────────────
@@ -181,45 +779,6 @@ def _prune_tasks():
                 pass
 
 
-# ── docx text replacement ───────────────────────────────────────
-
-def _replace_in_paragraph(paragraph, data: dict):
-    full_text = "".join(run.text for run in paragraph.runs)
-    if not PLACEHOLDER_RE.search(full_text):
-        return
-    new_text = full_text
-    for key, value in data.items():
-        new_text = new_text.replace("{{" + key + "}}", _format_value(value))
-    if new_text == full_text:
-        return
-    if paragraph.runs:
-        paragraph.runs[0].text = new_text
-        for run in paragraph.runs[1:]:
-            run.text = ""
-
-
-def _replace_in_table(table, data: dict):
-    for row in table.rows:
-        for cell in row.cells:
-            for paragraph in cell.paragraphs:
-                _replace_in_paragraph(paragraph, data)
-
-
-def _replace_in_document(doc, data: dict):
-    for paragraph in doc.paragraphs:
-        _replace_in_paragraph(paragraph, data)
-    for table in doc.tables:
-        _replace_in_table(table, data)
-    for section in doc.sections:
-        for hf in (section.header, section.footer):
-            if hf is None:
-                continue
-            for paragraph in hf.paragraphs:
-                _replace_in_paragraph(paragraph, data)
-            for table in hf.tables:
-                _replace_in_table(table, data)
-
-
 def _format_value(v):
     """Stringify a cell value for substitution.
 
@@ -278,29 +837,6 @@ def _is_money_header(header):
 
 # ── placeholder extraction ───────────────────────────────────────
 
-def extract_placeholders(template_path: str) -> list:
-    doc = Document(template_path)
-    found = set()
-
-    def _scan(paragraphs):
-        for p in paragraphs:
-            text = "".join(run.text for run in p.runs)
-            found.update(PLACEHOLDER_RE.findall(text))
-
-    def _scan_tables(tables):
-        for table in tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    _scan(cell.paragraphs)
-
-    _scan(doc.paragraphs)
-    _scan_tables(doc.tables)
-    for section in doc.sections:
-        for hf in (section.header, section.footer):
-            if hf:
-                _scan(hf.paragraphs)
-                _scan_tables(hf.tables)
-    return sorted(found)
 
 
 # ── Excel reading ────────────────────────────────────────────────
@@ -360,85 +896,718 @@ def _build_filename(record, filename_fields, idx):
     return f"notice_{idx:04d}"
 
 
-# ── render worker (module-scope so ProcessPoolExecutor can pickle it) ──
+# ── security overlay: watermark + guilloche + QR code ──────────
+#
+# Each generated DOCX gets three layered security artifacts:
+#   1. A full-page PNG overlay in the header (behindDoc=1) containing a
+#      light guilloche pattern plus a diagonal bilingual watermark
+#      "SS Legal Firm; for Respondent {name}" in English + Urdu.
+#   2. A QR code anchored to the last body paragraph, absolute-positioned
+#      at the bottom-right of the page (inside the body area, above the
+#      footer). The QR payload is the English watermark text only — the
+#      Urdu line is skipped to keep the code dense enough to scan.
+#
+# The overlay PNG is generated per-row because the name is personalized;
+# PIL + arabic_reshaper + python-bidi handle Urdu shaping and bi-di
+# reordering. If any of those deps are missing, the whole security pass
+# is silently skipped (placeholder replacement still runs).
 
-def _render_one_job(args):
-    """Open the template, replace placeholders, save the output docx.
+ENGLISH_WATERMARK_TEMPLATE = "SS Legal Firm; for Respondent {name}"
+URDU_WATERMARK_TEMPLATE = "ایس ایس لیگل فرم؛ جواب دہندہ {name} کے لیے"
 
-    Must be a plain module-scope function so `ProcessPoolExecutor` can
-    pickle it for cross-process dispatch. Returns the output path on
-    success and raises on failure — callers rely on `as_completed` for
-    progress counting, not on a return value.
-
-    `args` is a tuple `(template_path, merged, docx_path)` — all plain,
-    picklable types (strings and a flat dict).
-    """
-    template_path, merged, docx_path = args
-    doc = Document(template_path)
-    _replace_in_document(doc, merged)
-    doc.save(docx_path)
-    return docx_path
+# Prefer a single font that covers both Arabic script (Urdu) and Latin.
+# Mac ships Arial Unicode MS which is ideal; Debian/Ubuntu gets DejaVu
+# Sans from fonts-dejavu-core or Noto Sans from fonts-noto-core.
+_MIXED_FONT_CANDIDATES = (
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    "/Library/Fonts/Arial Unicode.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+)
 
 
-# ── batched LibreOffice PDF conversion ───────────────────────────
+def _pick_font_path():
+    for p in _MIXED_FONT_CANDIDATES:
+        if os.path.exists(p):
+            return p
+    return None
 
-def _batch_docx_to_pdf(docx_paths, out_dir, worker_id):
-    """Convert a batch of docx files to PDF in a single soffice invocation.
 
-    Each worker uses its own UserInstallation profile directory, which is
-    the only reliable way to run multiple soffice processes in parallel
-    without profile-lock contention.
-    """
-    if not docx_paths:
-        return
-    profile_dir = tempfile.mkdtemp(prefix=f"soffice_profile_{worker_id}_")
+def _shape_urdu(text):
+    """Reshape + bi-di reorder so PIL's left-to-right drawer renders Urdu correctly."""
+    return get_display(arabic_reshaper.reshape(text))
+
+
+# ── security overlay config (watermark + anti-counterfeit pattern) ──
+#
+# Each template stores its own `security` block in meta.json; callers pass
+# it to _render_security_overlay_png() to drive the generator. Missing
+# keys fall back to these defaults.
+
+DEFAULT_SECURITY_CONFIG = {
+    "watermark": {
+        "enabled": True,
+        "english_template": "SS Legal Firm; for Respondent {name}",
+        "urdu_template":    "ایس ایس لیگل فرم؛ جواب دہندہ {name} کے لیے",
+        "font_size":  22,     # px in the 1200-wide overlay canvas
+        "opacity":    67,     # percent, 0–100
+        "count":      25,     # total tiles per page; mapped to a near-square grid
+        "color":      "#323255",
+    },
+    "pattern": {
+        "enabled": True,
+        "opacity": 22,        # percent, 0–100 (avg across curves)
+        "density": "medium",  # low | medium | high | ultra
+    },
+}
+
+# Density → (sine curve count, spiral count, ring step px).
+PATTERN_DENSITY_PROFILES = {
+    "low":    (20,  4, 12),
+    "medium": (40,  8,  8),
+    "high":   (60, 12,  6),
+    "ultra":  (80, 16,  5),
+}
+
+
+def _merge_security_config(user_cfg):
+    """Deep-merge user-supplied security config on top of defaults."""
+    cfg = {k: dict(v) for k, v in DEFAULT_SECURITY_CONFIG.items()}
+    if not user_cfg:
+        return cfg
+    for section in ("watermark", "pattern"):
+        if section in user_cfg and isinstance(user_cfg[section], dict):
+            cfg[section].update(user_cfg[section])
+    return cfg
+
+
+def _hex_to_rgb(hex_str):
+    """'#RRGGBB' → (r, g, b). Silently ignore bad input, return slate."""
     try:
-        timeout = max(SOFFICE_TIMEOUT_MIN,
-                      len(docx_paths) * SOFFICE_TIMEOUT_PER_FILE)
-        result = subprocess.run(
-            ["soffice",
-             f"-env:UserInstallation=file://{profile_dir}",
-             "--headless", "--convert-to", "pdf",
-             "--outdir", out_dir, *docx_paths],
-            capture_output=True, text=True, timeout=timeout,
+        s = hex_str.lstrip("#")
+        if len(s) == 3:
+            s = "".join(ch * 2 for ch in s)
+        return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+    except Exception:
+        return (50, 50, 85)
+
+
+def _render_security_overlay_png(name, config=None,
+                                 width_px=1200, height_px=1697):
+    """Return PNG bytes: transparent full-page overlay with pattern + watermark.
+
+    `config` follows DEFAULT_SECURITY_CONFIG shape. Per-document random
+    seed derives from `name` so each notice has its own unique guilloche
+    fingerprint (harder to forge by copy-paste across documents).
+    """
+    import random
+    cfg = _merge_security_config(config)
+    rng = random.Random(hash(name) & 0xFFFFFFFF)
+
+    img = Image.new("RGBA", (width_px, height_px), (255, 255, 255, 0))
+    draw = ImageDraw.Draw(img)
+
+    # ─── Pattern layers ─────────────────────────────────────────
+    if cfg["pattern"].get("enabled", True):
+        p_op = max(0, min(100, int(cfg["pattern"].get("opacity", 22))))
+        # Map 0–100% to a ±15% alpha band centered on the requested level.
+        a_mid = int(p_op * 2.55)
+        pa_min = max(8,   a_mid - 12)
+        pa_max = min(220, a_mid + 18)
+        density = cfg["pattern"].get("density", "medium")
+        n_curves, n_spirals, ring_step = PATTERN_DENSITY_PROFILES.get(
+            density, PATTERN_DENSITY_PROFILES["medium"])
+
+        # Layer 1: sine curves with 3rd-harmonic wobble
+        for _ in range(n_curves):
+            alpha = rng.randint(pa_min, pa_max)
+            color = (rng.randint(60, 110), rng.randint(110, 160),
+                     rng.randint(160, 210), alpha)
+            f1 = rng.uniform(0.0028, 0.012)
+            f2 = f1 * rng.uniform(1.5, 3.0)
+            f3 = f1 * rng.uniform(4.0, 6.0)
+            amp = rng.uniform(80, 320)
+            pa_ = rng.uniform(0, 6.283)
+            pb_ = rng.uniform(0, 6.283)
+            pc_ = rng.uniform(0, 6.283)
+            base = rng.uniform(0, height_px)
+            prev = None
+            for x in range(0, width_px, 2):
+                y = (base
+                     + math.sin(x * f1 + pa_) * amp
+                     + math.sin(x * f2 + pb_) * (amp * 0.30)
+                     + math.sin(x * f3 + pc_) * (amp * 0.08))
+                pt = (x, y)
+                if prev is not None:
+                    draw.line([prev, pt], fill=color, width=1)
+                prev = pt
+
+        # Layer 2: Archimedean spirals scattered around
+        for _ in range(n_spirals):
+            cx = rng.uniform(0, width_px)
+            cy = rng.uniform(0, height_px)
+            alpha = rng.randint(max(4, pa_min - 10), max(20, pa_max - 10))
+            color = (rng.randint(60, 110), rng.randint(110, 160),
+                     rng.randint(160, 210), alpha)
+            prev = None
+            t_end = rng.uniform(18.0, 32.0)
+            a = rng.uniform(2.0, 5.5)
+            t = 0.0
+            while t < t_end:
+                r = a * t
+                x = cx + math.cos(t) * r
+                y = cy + math.sin(t) * r
+                if 0 <= x < width_px and 0 <= y < height_px:
+                    pt = (x, y)
+                    if prev is not None:
+                        draw.line([prev, pt], fill=color, width=1)
+                    prev = pt
+                else:
+                    prev = None
+                t += 0.06
+
+        # Layer 3: concentric rings around jittered center
+        rcx = width_px / 2 + rng.uniform(-100, 100)
+        rcy = height_px / 2 + rng.uniform(-120, 120)
+        ring_color = (100, 140, 200,
+                      rng.randint(max(4, pa_min - 15),
+                                  max(20, pa_max - 15)))
+        for r in range(14, 1300, ring_step):
+            draw.ellipse([rcx - r, rcy - r, rcx + r, rcy + r],
+                         outline=ring_color, width=1)
+
+    # ─── Tiled bilingual watermark ──────────────────────────────
+    if cfg["watermark"].get("enabled", True):
+        wm = cfg["watermark"]
+        font_px  = max(10, min(64, int(wm.get("font_size", 22))))
+        w_op     = max(0, min(100, int(wm.get("opacity", 67))))
+        w_alpha  = int(w_op * 2.55)
+        w_rgb    = _hex_to_rgb(wm.get("color", "#323255"))
+        count    = max(1, min(100, int(wm.get("count", 25))))
+
+        # Grid geometry: use a near-square grid that's slightly taller
+        # than wide to match A4 aspect.
+        cols = max(1, int(math.sqrt(count * (width_px / height_px))))
+        rows = max(1, int(math.ceil(count / cols)))
+
+        font_path = _pick_font_path()
+        font = (ImageFont.truetype(font_path, font_px)
+                if font_path else ImageFont.load_default())
+
+        english = wm.get("english_template", "").format(name=name)
+        try:
+            urdu = _shape_urdu(wm.get("urdu_template", "").format(name=name))
+        except Exception:
+            urdu = wm.get("urdu_template", "").format(name=name)
+
+        en_bb = draw.textbbox((0, 0), english, font=font)
+        ur_bb = draw.textbbox((0, 0), urdu, font=font)
+        tile_w = max(en_bb[2] - en_bb[0], ur_bb[2] - ur_bb[0]) + 8
+        tile_h = (en_bb[3] - en_bb[1]) + (ur_bb[3] - ur_bb[1]) + 6
+        if tile_w > 0 and tile_h > 0:
+            tile = Image.new("RGBA", (tile_w, tile_h), (255, 255, 255, 0))
+            td = ImageDraw.Draw(tile)
+            stamp = (*w_rgb, w_alpha)
+            td.text(((tile_w - (en_bb[2] - en_bb[0])) / 2, 0),
+                    english, font=font, fill=stamp)
+            if urdu.strip():
+                td.text(((tile_w - (ur_bb[2] - ur_bb[0])) / 2,
+                         (en_bb[3] - en_bb[1]) + 4),
+                        urdu, font=font, fill=stamp)
+            rotated = tile.rotate(30, expand=True, resample=Image.BICUBIC)
+            rw, rh = rotated.size
+
+            col_spacing = width_px / cols
+            row_spacing = height_px / rows
+            for row in range(rows):
+                for col in range(cols):
+                    if (row * cols + col) >= count:
+                        break
+                    stagger = (col_spacing / 2) if (row % 2) else 0
+                    cx_ = col * col_spacing + col_spacing * 0.5 + stagger
+                    cy_ = row * row_spacing + row_spacing * 0.5
+                    jx = rng.uniform(-18, 18)
+                    jy = rng.uniform(-12, 12)
+                    img.paste(rotated,
+                              (int(cx_ - rw / 2 + jx),
+                               int(cy_ - rh / 2 + jy)),
+                              rotated)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def _render_qr_png(text):
+    """Return PNG bytes for a medium-error-correction QR code."""
+    qr = qrcode.QRCode(
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=10, border=2)
+    qr.add_data(text)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+# ── HTML render pipeline (task 9) ────────────────────────────────
+#
+# Per row, produce a final non-extractable PDF by:
+#   1. Assembling a self-contained HTML string (base template with
+#      block markup swapped in, placeholders filled, security overlay
+#      + QR code + seal rotations baked into inline <style>/<img>).
+#   2. Rendering via headless Chromium to an intermediate vector PDF.
+#   3. Rasterizing every page at 300 dpi through PyMuPDF and re-embedding
+#      each page as a single image — this strips every text object so
+#      no PDF editor can select/copy/modify the text layer.
+#   4. Applying a permissions lock (pikepdf AES-256) that signals
+#      no-copy/no-modify and sets clean metadata.
+#
+# The pipeline is process-pool safe: each worker boots its own Chromium
+# once at startup (initializer) and reuses the browser across rows.
+
+try:
+    from playwright.sync_api import sync_playwright as _sync_playwright
+    import pymupdf as _pymupdf
+    import pikepdf as _pikepdf
+    _HTML_RENDER_DEPS_OK = True
+except ImportError:
+    _HTML_RENDER_DEPS_OK = False
+
+
+PDF_PRODUCER = "S&S Law Firm Legal Notice Generator"
+PDF_TITLE_DEFAULT = "Legal Notice"
+
+
+_ANY_OPEN_DIV = re.compile(r'<div\b[^>]*>')
+_ANY_CLOSE_DIV = re.compile(r'</div\s*>')
+
+
+def _swap_block_inner(html, purpose, inner_html):
+    """Replace the innerHTML of every <div data-purpose="PURPOSE"> ... </div>.
+
+    Handles nested <div>s by walking the source and counting depth —
+    a naive regex can't match the correct </div> when the block body
+    contains its own divs (meta grid, amounts table wrappers, etc.).
+    Replaces ALL occurrences, so blocks that repeat on every page
+    (like the contact footer) stay in sync.
+    """
+    open_re = re.compile(
+        r'<div[^>]*\sdata-purpose="' + re.escape(purpose) + r'"[^>]*>')
+    chunks = []
+    cursor = 0
+    while True:
+        m = open_re.search(html, cursor)
+        if not m:
+            chunks.append(html[cursor:])
+            break
+        chunks.append(html[cursor:m.end()])
+        i = m.end()
+        depth = 1
+        close_pos = None
+        while i < len(html) and depth > 0:
+            mo = _ANY_OPEN_DIV.search(html, i)
+            mc = _ANY_CLOSE_DIV.search(html, i)
+            if mc is None:
+                return html  # malformed — bail without mutating
+            if mo is not None and mo.start() < mc.start():
+                depth += 1
+                i = mo.end()
+            else:
+                depth -= 1
+                if depth == 0:
+                    close_pos = mc.start()
+                    break
+                i = mc.end()
+        if close_pos is None:
+            return html  # unbalanced — bail without mutating
+        chunks.append("\n" + inner_html + "\n")
+        cursor = close_pos
+    return "".join(chunks)
+
+
+def _rewrite_static_to_relative(html):
+    """Rewrite absolute /static/… → relative static/… so the HTML can
+    be written anywhere inside templates/ and loaded via file://,
+    letting Chromium resolve fonts/images from the sibling static/
+    directory without a server. Flask still serves /static/ for the
+    live browser preview because @app.route("/static/...") matches."""
+    return (html
+            .replace('"/static/', '"static/')
+            .replace("'/static/", "'static/"))
+
+
+def _swap_asset_src(html, slot, src_url):
+    """Swap the src of <img data-slot="SLOT" src="..."> to src_url."""
+    return re.sub(
+        r'(<img[^>]*\sdata-slot="' + re.escape(slot) + r'"[^>]*\ssrc=")[^"]*(")',
+        lambda m: m.group(1) + src_url + m.group(2),
+        html, count=1)
+
+
+# 32-char alphabet used for the anti-counterfeit serial printed under
+# the QR. 0/O and 1/I are omitted so the string stays readable when
+# someone transcribes it from a paper copy.
+_QR_SN_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def generate_qr_serial(name):
+    """Deterministic 16-character (4×4 groups) anti-counterfeit code.
+
+    Seeded by hash(name) so the SAME respondent always gets the SAME
+    code — lets the firm reverse-lookup authenticity — but different
+    respondents get statistically different codes, so an attacker can't
+    copy a known-good notice and swap names."""
+    srng = random.Random(hash(name) & 0xFFFFFFFF)
+    chars = [srng.choice(_QR_SN_ALPHABET) for _ in range(16)]
+    return "-".join("".join(chars[i:i + 4]) for i in (0, 4, 8, 12))
+
+
+def build_notice_html(template, row_data, manual_fields=None,
+                     base_html=None, static_dir=None,
+                     fill_placeholders=True, strip_unfilled=None):
+    """Produce a fully self-contained HTML string for one row.
+
+    * template          — dict from load_template() (blocks, assets, security)
+    * row_data          — placeholder dict from an Excel row
+    * manual_fields     — optional overrides for unmatched placeholders
+    * base_html         — cached base template text (re-read if None)
+    * static_dir        — absolute path to templates/static (uses default)
+    * fill_placeholders — run the `{{foo}}` → value substitution pass.
+                          False means the bare template is returned
+                          (literal `{{name}}` etc.).
+    * strip_unfilled    — after substitution, regex-strip any leftover
+                          `{{foo}}` to empty string. Defaults to
+                          fill_placeholders so real renders drop
+                          unfilled keys but the manual live-preview
+                          (partial fill) keeps them visible as literal
+                          placeholders for fields the user hasn't typed
+                          yet.
+    """
+    if base_html is None:
+        with open(TEMPLATE_BASE_HTML_PATH, "r", encoding="utf-8") as f:
+            base_html = f.read()
+    if static_dir is None:
+        static_dir = TEMPLATE_STATIC_DIR
+    if strip_unfilled is None:
+        strip_unfilled = fill_placeholders
+
+    merged = {**(manual_fields or {}), **(row_data or {})}
+    # Name resolution: drives watermark, QR text, per-doc random
+    # rotations, and the anti-counterfeit serial.
+    #   - bare template preview (fill_placeholders=False) → "{name}"
+    #   - real render (fill + strip) → typed value or "Respondent"
+    #   - manual live preview (fill + no strip) → typed value or
+    #     "{name}" so unfilled placeholders stay visible
+    if not fill_placeholders:
+        name = "{name}"
+    else:
+        typed = str(merged.get("name", "") or "").strip()
+        if typed:
+            name = typed
+        elif strip_unfilled:
+            name = "Respondent"
+        else:
+            name = "{name}"
+
+    # 1. Swap editable blocks with rendered HTML fragments.
+    blocks_text = template.get("blocks") or dict(DEFAULT_BLOCKS_TEXT)
+    rendered = render_blocks_to_html(blocks_text)
+    html = base_html
+    for purpose, inner in rendered.items():
+        html = _swap_block_inner(html, purpose, inner)
+
+    # 2. Swap any per-template asset overrides. These are absolute
+    # filesystem paths, not /static URLs; we inline them as data URIs
+    # so they travel with the HTML into Chromium's sandboxed renderer.
+    for kind, path in (template.get("assets") or {}).items():
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            b64 = base64.b64encode(data).decode()
+            html = _swap_asset_src(html, kind, f"data:image/png;base64,{b64}")
+        except OSError:
+            pass
+
+    # 3. Fill {{placeholders}}. Substitute every key in merged, then
+    # optionally strip leftover `{{foo}}` tokens to empty strings. The
+    # strip is what makes the final PDF clean of unfilled placeholders;
+    # the manual live-preview keeps strip_unfilled=False so un-typed
+    # fields stay visible as literal `{{foo}}`.
+    if fill_placeholders:
+        for k, v in merged.items():
+            html = html.replace("{{" + k + "}}", _format_value(v))
+        if strip_unfilled:
+            html = PLACEHOLDER_RE.sub("", html)
+
+    # 4. Rewrite /static → static so the HTML loads fonts/images
+    # relative to wherever we park it on disk (e.g., inside templates/).
+    html = _rewrite_static_to_relative(html)
+
+    # 4.5 Anti-counterfeit serial under the QR. Deterministic per-name,
+    # so the SAME respondent always gets the SAME code across reruns
+    # (lets the firm reverse-lookup authenticity). Generated regardless
+    # of whether the security/QR deps are installed.
+    html = html.replace("__QR_SN__", generate_qr_serial(name))
+
+    # 5. Inject security overlay + QR + per-doc seal rotations +
+    #    per-template asset placement vars.
+    assets_cfg = template.get("assets_config") or DEFAULT_ASSETS_CONFIG
+    def _asset_vars():
+        # CSS var prefix per asset kind — sig/seal/logo
+        prefix = {"logo": "logo", "seal": "seal", "signature_seal": "sig"}
+        parts = []
+        for kind, cfg in assets_cfg.items():
+            px = prefix[kind]
+            parts.append(f"--{px}-size: {cfg['size']}mm;")
+            parts.append(f"--{px}-dx:   {cfg['dx']}mm;")
+            parts.append(f"--{px}-dy:   {cfg['dy']}mm;")
+            parts.append(f"--{px}-rot-base: {cfg['rot']}deg;")
+        return " ".join(parts)
+
+    if _SECURITY_DEPS_OK:
+        sec_cfg = template.get("security") or load_default_security()
+        overlay_png = _render_security_overlay_png(name, config=sec_cfg)
+        overlay_b64 = ("data:image/png;base64,"
+                       + base64.b64encode(overlay_png).decode())
+
+        wm = sec_cfg.get("watermark", {})
+        qr_text = (wm.get("english_template") or "").format(name=name)
+        if not qr_text.strip():
+            qr_text = f"SS Legal Firm; for Respondent {name}"
+        qr_png = _render_qr_png(qr_text)
+        qr_b64 = "data:image/png;base64," + base64.b64encode(qr_png).decode()
+
+        srng = random.Random(hash(name) & 0xFFFFFFFF)
+        firm_rot = srng.uniform(-15, 15)
+        sig_rot  = srng.uniform(-15, 15)
+        injection = (
+            f'<style id="security-overlay">'
+            f'  .page {{'
+            f'    background-image: url("{overlay_b64}");'
+            f'    background-size: 100% 100%;'
+            f'    background-repeat: no-repeat;'
+            f'    --firm-rot: {firm_rot:.2f}deg;'
+            f'    --sig-rot:  {sig_rot:.2f}deg;'
+            f'    {_asset_vars()}'
+            f'  }}'
+            f'</style>'
         )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"LibreOffice conversion failed (worker {worker_id}): "
-                f"{result.stderr[:500]}")
-    finally:
-        shutil.rmtree(profile_dir, ignore_errors=True)
+        html = html.replace("</head>", injection + "</head>", 1)
+        html = html.replace(
+            '<div class="placeholder">QR</div>',
+            f'<img src="{qr_b64}" alt="QR" '
+            f'style="width:100%;height:100%;object-fit:contain;">')
+    else:
+        # Security deps missing (no watermark/QR), but still expose the
+        # asset-placement vars so resizing/positioning still works.
+        injection = (
+            f'<style id="asset-vars">'
+            f'  .page {{ {_asset_vars()} }}'
+            f'</style>'
+        )
+        html = html.replace("</head>", injection + "</head>", 1)
+    return html
 
 
-# ── group-by-group generation ────────────────────────────────────
+def _playwright_render_html_to_pdf(html, output_pdf, browser=None):
+    """Render HTML string → A4 PDF via headless Chromium.
 
-def _process_group(template_path, rows, group_name, manual_fields,
-                   filename_fields, output_format, task_id,
-                   cumulative_before, grand_total,
-                   render_pool, render_mode,
-                   convert_workers, pdf_chunk_size):
-    """Render, convert (if PDF), and zip up one group's notices.
+    The HTML is dropped as a temp file inside templates/ (so sibling
+    `static/` folder resolves correctly) and loaded via file:// URL,
+    avoiding the about:blank base-URL issue that breaks relative
+    asset loading with page.set_content()."""
+    pw_ctx = None
+    own_browser = False
+    if browser is None:
+        pw_ctx = _sync_playwright().start()
+        browser = pw_ctx.chromium.launch()
+        own_browser = True
 
-    Returns the on-disk path of the group's zip. The zip contains a flat
-    list of files named by `filename_fields` (joined with `_`).
-
-    `render_pool` is a long-lived executor (process or thread) provided by
-    the caller; this keeps the process-spawn cost amortized across all
-    groups in the task instead of paying it per group. `render_mode` is
-    either "processes" or "threads" for user-visible logging.
-    """
-    tmp_dir = tempfile.mkdtemp(prefix=f"notice_{_safe_name(group_name)[:32]}_")
+    # Write HTML into the templates dir so relative `static/…` resolves.
+    tmp_name = f"_render_{uuid.uuid4().hex}.html"
+    tmp_path = os.path.join(TEMPLATE_BASE_DIR, tmp_name)
     try:
-        docx_dir = os.path.join(tmp_dir, "docx")
-        pdf_dir = os.path.join(tmp_dir, "pdf")
-        os.makedirs(docx_dir, exist_ok=True)
-        os.makedirs(pdf_dir, exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        url = "file://" + tmp_path
+        page = browser.new_page()
+        try:
+            page.goto(url, wait_until="networkidle")
+            page.emulate_media(media="print")
+            page.pdf(path=output_pdf, format="A4",
+                     margin={"top": "0", "right": "0",
+                             "bottom": "0", "left": "0"},
+                     print_background=True)
+        finally:
+            page.close()
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        if own_browser:
+            browser.close()
+            pw_ctx.stop()
 
-        # ── build per-row jobs with filename uniqueness inside this group ──
+
+def _rasterize_pdf(in_pdf, out_pdf, dpi=300):
+    """Render every page at `dpi`, rebuild as image-only PDF.
+    After this pass the PDF has no text objects — copying or editing
+    the text layer is impossible in any PDF viewer/editor."""
+    src = _pymupdf.open(in_pdf)
+    dst = _pymupdf.open()
+    try:
+        for page in src:
+            pix = page.get_pixmap(dpi=dpi, alpha=False)
+            page_w, page_h = page.rect.width, page.rect.height
+            new = dst.new_page(width=page_w, height=page_h)
+            new.insert_image(new.rect, stream=pix.tobytes("png"))
+        dst.save(out_pdf, garbage=4, deflate=True)
+    finally:
+        src.close()
+        dst.close()
+
+
+def _apply_pdf_lock(in_pdf, out_pdf, title=PDF_TITLE_DEFAULT,
+                    producer=PDF_PRODUCER):
+    """AES-256-encrypt with no-copy / no-modify permissions + metadata.
+    The user password is empty so anyone can *open* the PDF; the owner
+    password is a random 32-byte string nobody holds, so no one can
+    downgrade the permissions. Printing stays allowed."""
+    owner_pw = base64.b64encode(os.urandom(24)).decode()
+    try:
+        pdf = _pikepdf.open(in_pdf)
+    except _pikepdf.PdfError:
+        # If the input is already encrypted or malformed, fall back to
+        # copying raw bytes rather than failing the whole row.
+        shutil.copy(in_pdf, out_pdf)
+        return
+    try:
+        with pdf.open_metadata() as meta:
+            meta["dc:title"] = title
+            meta["pdf:Producer"] = producer
+        pdf.docinfo["/Title"] = title
+        pdf.docinfo["/Producer"] = producer
+        pdf.docinfo["/CreationDate"] = (
+            "D:" + datetime.datetime.now().strftime("%Y%m%d%H%M%S") + "Z")
+        permissions = _pikepdf.Permissions(
+            accessibility=True,
+            extract=False,              # disallow copy
+            modify_annotation=False,
+            modify_assembly=False,
+            modify_form=False,
+            modify_other=False,
+            print_highres=True,
+            print_lowres=True,
+        )
+        pdf.save(out_pdf,
+                 encryption=_pikepdf.Encryption(
+                     owner=owner_pw, user="", allow=permissions))
+    finally:
+        pdf.close()
+
+
+def render_notice_row_pdf(template, row_data, output_pdf,
+                          manual_fields=None, base_html=None,
+                          static_dir=None, browser=None,
+                          rasterize=True, lock=True,
+                          dpi=300, title=PDF_TITLE_DEFAULT):
+    """End-to-end: build HTML → Chromium → rasterize → lock.
+
+    Returns `output_pdf`. `browser` is an optional pooled Chromium
+    instance (supplied by process-pool initializer). `rasterize`/`lock`
+    can be disabled for faster dev iteration; production keeps both on
+    so copy/edit are blocked."""
+    html = build_notice_html(template, row_data,
+                             manual_fields=manual_fields,
+                             base_html=base_html,
+                             static_dir=static_dir)
+    with tempfile.TemporaryDirectory(prefix="legal_notice_") as tmp:
+        vector_pdf = os.path.join(tmp, "vector.pdf")
+        _playwright_render_html_to_pdf(html, vector_pdf, browser=browser)
+        if not rasterize and not lock:
+            shutil.copy(vector_pdf, output_pdf)
+            return output_pdf
+        raster_pdf = vector_pdf
+        if rasterize:
+            raster_pdf = os.path.join(tmp, "raster.pdf")
+            _rasterize_pdf(vector_pdf, raster_pdf, dpi=dpi)
+        if lock:
+            _apply_pdf_lock(raster_pdf, output_pdf, title=title)
+        else:
+            shutil.copy(raster_pdf, output_pdf)
+    return output_pdf
+
+
+# ── process-pool worker for batched HTML→PDF generation ──────────
+#
+# Each worker process boots ONE Chromium + ONE Playwright context at
+# init time and reuses the browser across all jobs it handles. This
+# amortizes the ~1-second browser-startup cost across the whole
+# batch. Workers are re-spawned if the pool is re-initialized.
+
+_WORKER_PW = None
+_WORKER_BROWSER = None
+
+
+def _html_worker_init():
+    global _WORKER_PW, _WORKER_BROWSER
+    _WORKER_PW = _sync_playwright().start()
+    _WORKER_BROWSER = _WORKER_PW.chromium.launch()
+
+
+def _html_worker_job(args):
+    """Process-pool worker: render one row, return the output path."""
+    (template, row_data, output_pdf, manual_fields,
+     base_html, static_dir, dpi, title) = args
+    return render_notice_row_pdf(
+        template, row_data, output_pdf,
+        manual_fields=manual_fields,
+        base_html=base_html, static_dir=static_dir,
+        browser=_WORKER_BROWSER,
+        rasterize=True, lock=True, dpi=dpi, title=title)
+
+
+def extract_template_placeholders(template=None):
+    """Return placeholders in the order they visually appear in the
+    rendered notice — so the manual-single form's inputs match the
+    on-page reading order (date / TO: block → subject → narrative →
+    amounts table → page 2).
+
+    We swap the editable blocks into the base HTML (without touching
+    `{{...}}` tokens) and then scan the result once. `dict.fromkeys`
+    keeps each placeholder at its first appearance."""
+    try:
+        with open(TEMPLATE_BASE_HTML_PATH, "r", encoding="utf-8") as f:
+            html = f.read()
+    except OSError:
+        return []
+    if template:
+        blocks_text = template.get("blocks") or dict(DEFAULT_BLOCKS_TEXT)
+        rendered = render_blocks_to_html(blocks_text)
+        for purpose, inner in rendered.items():
+            html = _swap_block_inner(html, purpose, inner)
+    ordered = PLACEHOLDER_RE.findall(html)
+    return list(dict.fromkeys(ordered))
+
+
+def _process_group_html(template, rows, group_name, manual_fields,
+                        filename_fields, task_id, cumulative_before,
+                        grand_total, pool, base_html, static_dir,
+                        dpi, title):
+    """Render every row in one group, pack into a zip, return zip path."""
+    tmp = tempfile.mkdtemp(prefix=f"notice_{_safe_name(group_name)[:32]}_")
+    try:
+        # Build unique per-row output filenames.
         taken = set()
         jobs = []
         for i, record in enumerate(rows, start=1):
-            merged = {**manual_fields, **record}
+            merged = {**(manual_fields or {}), **record}
             base = _build_filename(merged, filename_fields, i)
             unique = base
             n = 1
@@ -446,137 +1615,59 @@ def _process_group(template_path, rows, group_name, manual_fields,
                 n += 1
                 unique = f"{base}_{n}"
             taken.add(unique)
-            internal = uuid.uuid4().hex
-            jobs.append({
-                "base": unique,
-                "internal": internal,
-                "docx_path": os.path.join(docx_dir, f"{internal}.docx"),
-                "merged": merged,
-            })
+            output = os.path.join(tmp, f"{unique}.pdf")
+            jobs.append((unique, output, record))
 
         group_total = len(jobs)
-        progress_lock = threading.Lock()
-
-        def bump(stage_label, group_done):
-            """Update both per-group and overall progress counters."""
-            if not task_id:
-                return
-            _update_task(
-                task_id,
-                stage=stage_label,
-                group_progress=group_done,
-                progress=cumulative_before + group_done,
-                message=f"{stage_label} {group_name}: {group_done}/{group_total}",
-            )
-
-        # ── parallel docx rendering ──
         if task_id:
             _update_task(task_id, stage="rendering",
                          current_group=group_name,
-                         group_total=group_total,
-                         group_progress=0,
-                         message=f"rendering {group_name} via {render_mode}: 0/{group_total}")
+                         group_total=group_total, group_progress=0,
+                         message=f"rendering {group_name}: 0/{group_total}")
 
-        # Submit all jobs to the caller-provided render pool. The pool may
-        # be a ProcessPoolExecutor (GIL-free, scales with cores) or a
-        # ThreadPoolExecutor fallback — the `_render_one_job` function is
-        # the same either way. Progress ticks come from `as_completed`,
-        # counted on the main side, so no cross-process shared state is
-        # needed.
-        payloads = [(template_path, job["merged"], job["docx_path"]) for job in jobs]
-        futures = [render_pool.submit(_render_one_job, p) for p in payloads]
-        done_count = 0
+        args_list = [
+            (template, record, output, manual_fields,
+             base_html, static_dir, dpi, title)
+            for (_, output, record) in jobs
+        ]
+        futures = [pool.submit(_html_worker_job, a) for a in args_list]
+        done = 0
         for fut in concurrent.futures.as_completed(futures):
             fut.result()  # propagate exceptions
-            done_count += 1
-            if done_count % 5 == 0 or done_count == group_total:
-                bump("rendering", done_count)
-        bump("rendering", group_total)
-
-        # ── conversion (optional) ──
-        out_items = []  # list of (arcname_in_zip, disk_path)
-        if output_format == "pdf":
-            if task_id:
-                _update_task(task_id, stage="converting",
-                             group_progress=0,
-                             message=f"converting {group_name}: 0/{group_total}")
-
-            docx_paths = [j["docx_path"] for j in jobs]
-            chunks = [docx_paths[i:i + pdf_chunk_size]
-                      for i in range(0, len(docx_paths), pdf_chunk_size)]
-
-            converted = {"n": 0}
-            worker_seq = {"n": 0}
-
-            def convert_chunk(chunk):
-                # Unique worker id per chunk so each soffice call gets its
-                # own UserInstallation profile dir.
-                with progress_lock:
-                    worker_seq["n"] += 1
-                    wid = worker_seq["n"]
-                _batch_docx_to_pdf(chunk, pdf_dir, wid)
-                with progress_lock:
-                    converted["n"] += len(chunk)
-                    n = converted["n"]
-                bump("converting", n)
-
-            n_workers = min(convert_workers, max(1, len(chunks)))
-            with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
-                for _ in pool.map(convert_chunk, chunks):
-                    pass
-            bump("converting", group_total)
-
-            for job in jobs:
-                pdf_path = os.path.join(pdf_dir, f"{job['internal']}.pdf")
-                if not os.path.exists(pdf_path):
-                    raise RuntimeError(f"Missing PDF output for {job['base']}")
-                out_items.append((f"{job['base']}.pdf", pdf_path))
-        else:
-            for job in jobs:
-                out_items.append((f"{job['base']}.docx", job["docx_path"]))
-
-        # ── pack this group into its own zip ──
+            done += 1
+            if task_id and (done % 3 == 0 or done == group_total):
+                _update_task(task_id,
+                             progress=cumulative_before + done,
+                             group_progress=done,
+                             message=f"rendering {group_name}: {done}/{group_total}")
         if task_id:
             _update_task(task_id, stage="packing",
                          message=f"packing {group_name}.zip")
 
-        safe_group = _safe_name(group_name)
+        safe = _safe_name(group_name)
         zip_path = os.path.join(
-            UPLOAD_DIR, f"part_{uuid.uuid4().hex}_{safe_group}.zip")
+            UPLOAD_DIR, f"part_{uuid.uuid4().hex}_{safe}.zip")
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for arcname, path in out_items:
-                zf.write(path, arcname)
+            for (unique, output, _) in jobs:
+                if os.path.exists(output):
+                    zf.write(output, f"{unique}.pdf")
         return zip_path
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
-def generate_notices(template_path, data_rows, manual_fields,
-                     filename_fields=None, group_by_field=None,
-                     output_format="docx", task_id=None,
-                     render_workers=2, convert_workers=2,
-                     pdf_chunk_size=15, profile_label=""):
-    """Group-by-group processing.
-
-    - Sort rows by `group_by_field` (stable), bucket into ordered groups.
-    - For each group: render → convert → pack into `<group>.zip`.
-    - As soon as a group's zip is ready, append it to the task's
-      `ready_parts` list; the frontend polls for new parts and downloads
-      each one immediately. There is no outer "master" zip.
-    - If `group_by_field` is empty, the whole batch is treated as a single
-      group named "output" and produces a single zip.
-
-    The render pool is created once per task and reused across all groups
-    to amortize process-spawn cost. If `ProcessPoolExecutor` can't be
-    constructed for any reason, we fall back to `ThreadPoolExecutor` —
-    slower but guaranteed to work anywhere.
-    """
+def generate_notices_html(template, data_rows, manual_fields=None,
+                          filename_fields=None, group_by_field=None,
+                          task_id=None, render_workers=2,
+                          dpi=300, title=PDF_TITLE_DEFAULT,
+                          profile_label=""):
+    """Render every row into a locked non-extractable PDF and pack into
+    per-group zips (or a single output.zip if no group_by_field)."""
     total = len(data_rows)
 
     if group_by_field:
-        def group_key(r):
-            return _format_value(r.get(group_by_field, ""))
-        sorted_rows = sorted(data_rows, key=group_key)
+        sorted_rows = sorted(
+            data_rows, key=lambda r: _format_value(r.get(group_by_field, "")))
         buckets = defaultdict(list)
         for r in sorted_rows:
             g = _safe_name(r.get(group_by_field, "") or "unassigned")
@@ -585,62 +1676,49 @@ def generate_notices(template_path, data_rows, manual_fields,
     else:
         groups_ordered = [("output", list(data_rows))]
 
-    # Build the long-lived render pool once per task. Try processes first
-    # (GIL-free, scales with cores). Fall back to threads on any startup
-    # error so the tool still works on constrained environments.
-    render_pool = None
-    render_mode = "processes"
-    try:
-        render_pool = concurrent.futures.ProcessPoolExecutor(max_workers=render_workers)
-    except (OSError, ImportError, NotImplementedError) as e:
-        print(f"[generate_notices] ProcessPoolExecutor unavailable ({e}); "
-              f"falling back to threads")
-        render_pool = concurrent.futures.ThreadPoolExecutor(max_workers=render_workers)
-        render_mode = "threads"
+    # Cache base HTML text once to avoid re-reading per row.
+    with open(TEMPLATE_BASE_HTML_PATH, "r", encoding="utf-8") as f:
+        base_html = f.read()
 
-    start_message = (f"Processing {len(groups_ordered)} group(s), "
-                     f"{total} item(s) total · profile={profile_label or '?'} "
-                     f"· render={render_mode}×{render_workers} "
-                     f"· convert={convert_workers}")
-
+    start_msg = (f"Processing {len(groups_ordered)} group(s), {total} row(s) "
+                 f"· profile={profile_label or '?'} · "
+                 f"workers={render_workers} · dpi={dpi}")
     if task_id:
-        _update_task(task_id,
-                     status="running",
-                     stage="queued",
-                     total=total,
-                     progress=0,
-                     groups_total=len(groups_ordered),
-                     groups_done=0,
-                     ready_parts=[],
-                     current_group="",
-                     group_total=0,
-                     group_progress=0,
-                     message=start_message)
+        _update_task(task_id, status="running", stage="queued",
+                     total=total, progress=0,
+                     groups_total=len(groups_ordered), groups_done=0,
+                     ready_parts=[], current_group="",
+                     group_total=0, group_progress=0, message=start_msg)
+
+    # Try to spin up a ProcessPoolExecutor with per-process Chromium.
+    pool = None
+    try:
+        pool = concurrent.futures.ProcessPoolExecutor(
+            max_workers=render_workers,
+            initializer=_html_worker_init)
+    except Exception as e:
+        print(f"[generate_notices_html] ProcessPool unavailable ({e}); "
+              f"falling back to single-process serial rendering")
 
     cumulative = 0
     try:
         for idx, (group_name, rows) in enumerate(groups_ordered):
             if task_id:
                 _update_task(task_id, current_group=group_name)
-            zip_path = _process_group(
-                template_path=template_path,
-                rows=rows,
-                group_name=group_name,
-                manual_fields=manual_fields,
-                filename_fields=filename_fields,
-                output_format=output_format,
-                task_id=task_id,
-                cumulative_before=cumulative,
-                grand_total=total,
-                render_pool=render_pool,
-                render_mode=render_mode,
-                convert_workers=convert_workers,
-                pdf_chunk_size=pdf_chunk_size,
-            )
-            cumulative += len(rows)
 
-            # Append this group's zip to ready_parts so the frontend can pick
-            # it up on its next status poll.
+            if pool is not None:
+                zip_path = _process_group_html(
+                    template, rows, group_name, manual_fields,
+                    filename_fields, task_id, cumulative, total,
+                    pool, base_html, TEMPLATE_STATIC_DIR, dpi, title)
+            else:
+                # Serial fallback: render every row in the main process.
+                zip_path = _process_group_html_serial(
+                    template, rows, group_name, manual_fields,
+                    filename_fields, task_id, cumulative, total,
+                    base_html, TEMPLATE_STATIC_DIR, dpi, title)
+
+            cumulative += len(rows)
             with TASKS_LOCK:
                 t = TASKS.get(task_id) if task_id else None
                 if t is not None:
@@ -655,9 +1733,8 @@ def generate_notices(template_path, data_rows, manual_fields,
                     t["groups_done"] = idx + 1
                     t["progress"] = cumulative
     finally:
-        # Always shut the render pool down, even on exception, so worker
-        # processes don't leak across tasks.
-        render_pool.shutdown(wait=True)
+        if pool is not None:
+            pool.shutdown(wait=True)
 
     if task_id:
         _update_task(task_id, status="done", stage="done",
@@ -665,11 +1742,74 @@ def generate_notices(template_path, data_rows, manual_fields,
                      message=f"All {len(groups_ordered)} group(s) ready")
 
 
+def _process_group_html_serial(template, rows, group_name, manual_fields,
+                               filename_fields, task_id, cumulative_before,
+                               grand_total, base_html, static_dir,
+                               dpi, title):
+    """Same as _process_group_html but without a process pool — renders
+    each row sequentially in-process. Used as fallback when
+    multiprocessing can't be initialized (some VPS setups)."""
+    tmp = tempfile.mkdtemp(prefix=f"notice_{_safe_name(group_name)[:32]}_")
+    try:
+        taken = set()
+        jobs = []
+        for i, record in enumerate(rows, start=1):
+            merged = {**(manual_fields or {}), **record}
+            base = _build_filename(merged, filename_fields, i)
+            unique = base; n = 1
+            while unique in taken:
+                n += 1
+                unique = f"{base}_{n}"
+            taken.add(unique)
+            output = os.path.join(tmp, f"{unique}.pdf")
+            jobs.append((unique, output, record))
+
+        group_total = len(jobs)
+        if task_id:
+            _update_task(task_id, stage="rendering",
+                         current_group=group_name,
+                         group_total=group_total, group_progress=0)
+
+        # Keep one browser open across the whole group.
+        pw = _sync_playwright().start()
+        browser = pw.chromium.launch()
+        try:
+            for done, (unique, output, record) in enumerate(jobs, start=1):
+                render_notice_row_pdf(
+                    template, record, output,
+                    manual_fields=manual_fields,
+                    base_html=base_html, static_dir=static_dir,
+                    browser=browser, rasterize=True, lock=True,
+                    dpi=dpi, title=title)
+                if task_id and (done % 3 == 0 or done == group_total):
+                    _update_task(task_id,
+                                 progress=cumulative_before + done,
+                                 group_progress=done,
+                                 message=f"rendering {group_name}: {done}/{group_total}")
+        finally:
+            browser.close()
+            pw.stop()
+
+        safe = _safe_name(group_name)
+        zip_path = os.path.join(
+            UPLOAD_DIR, f"part_{uuid.uuid4().hex}_{safe}.zip")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for (unique, output, _) in jobs:
+                if os.path.exists(output):
+                    zf.write(output, f"{unique}.pdf")
+        return zip_path
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
 # ── routes ───────────────────────────────────────────────────────
 
 @app.before_request
 def _require_auth():
     if request.path in _AUTH_EXEMPT_PATHS:
+        return None
+    # Fonts/images under /static are always public — they're referenced
+    # from the preview iframe before any session cookie is available.
+    if request.path.startswith("/static/"):
         return None
     if session.get("auth_ok") is True:
         return None
@@ -716,37 +1856,46 @@ def index():
     return Response(HTML_TEMPLATE, mimetype="text/html")
 
 
+@app.route("/api/templates", methods=["GET"])
+def api_list_templates():
+    return jsonify(list_templates())
+
+
 @app.route("/upload", methods=["POST"])
 def upload():
-    template_file = request.files.get("template")
+    """Accept an Excel file; analyze its headers against the chosen
+    template's placeholders. Stashes Excel path + template slug in
+    session so /generate can pick them up later."""
     excel_file = request.files.get("excel")
+    template_slug = (request.form.get("template_slug") or "default").strip()
 
-    if not template_file or not excel_file:
-        return jsonify(error="Please upload both template and Excel files."), 400
+    if not excel_file:
+        return jsonify(error="Please upload an Excel file."), 400
+
+    template = load_template(template_slug)
+    if template is None:
+        return jsonify(error=f"Template '{template_slug}' not found."), 400
 
     sid = uuid.uuid4().hex
     work_dir = os.path.join(UPLOAD_DIR, sid)
     os.makedirs(work_dir, exist_ok=True)
-
-    tpl_path = os.path.join(work_dir, "template.docx")
     xls_path = os.path.join(work_dir, "data.xlsx")
-    template_file.save(tpl_path)
     excel_file.save(xls_path)
 
     try:
-        placeholders = extract_placeholders(tpl_path)
+        placeholders = extract_template_placeholders(template)
         headers, data_rows = read_excel(xls_path)
     except Exception as e:
         shutil.rmtree(work_dir, ignore_errors=True)
-        return jsonify(error=f"Failed to read files: {e}"), 400
+        return jsonify(error=f"Failed to read Excel: {e}"), 400
 
     headers_clean = [h for h in headers if h]
     matched = [p for p in placeholders if p in set(headers_clean)]
     missing = [p for p in placeholders if p not in set(headers_clean)]
 
     session["sid"] = sid
-    session["tpl_path"] = tpl_path
     session["xls_path"] = xls_path
+    session["template_slug"] = template_slug
 
     return jsonify(
         placeholders=placeholders,
@@ -755,35 +1904,36 @@ def upload():
         missing=missing,
         row_count=len(data_rows),
         preview=data_rows[:5],
+        template_name=template.get("name"),
+        template_slug=template_slug,
     )
 
 
 @app.route("/generate", methods=["POST"])
 def generate():
     sid = session.get("sid")
-    tpl_path = session.get("tpl_path")
     xls_path = session.get("xls_path")
+    template_slug = session.get("template_slug", "default")
 
-    if not sid or not tpl_path or not os.path.exists(tpl_path):
-        return jsonify(error="Please upload files first."), 400
+    if not sid or not xls_path or not os.path.exists(xls_path):
+        return jsonify(error="Please upload an Excel file first."), 400
+
+    template = load_template(template_slug)
+    if template is None:
+        return jsonify(error=f"Template '{template_slug}' not found."), 400
 
     payload = request.get_json() or {}
     manual_fields = payload.get("manual_fields", {}) or {}
     filename_fields = payload.get("filename_fields") or []
     group_by_field = payload.get("group_by_field") or None
-    output_format = payload.get("output_format", "docx")
 
-    # Machine profile is chosen in the webpage. Default is the conservative
-    # "vps" profile. Picking "mac" unlocks all cores for ProcessPoolExecutor.
     profile = _get_machine_profile(payload.get("machine"))
 
     _, data_rows = read_excel(xls_path)
     if not data_rows:
         return jsonify(error="No data rows found in Excel."), 400
 
-    # Date is picked in the webpage and always overrides any Excel column.
-    # The webpage sends an ISO date string (YYYY-MM-DD); we format as DD/MM/YYYY
-    # and force it onto every row's "date" field, stomping whatever Excel had.
+    # Date picker override — webpage sends ISO YYYY-MM-DD, we want DD/MM/YYYY.
     date_value = (payload.get("date_value") or "").strip()
     if date_value:
         try:
@@ -794,23 +1944,17 @@ def generate():
         except ValueError:
             pass
 
-    # Copy template into a task-owned file so the session work_dir can be
-    # cleaned up independently of the background task lifecycle.
     task_id = _new_task()
-    task_tpl = os.path.join(UPLOAD_DIR, f"task_{task_id}.docx")
-    shutil.copy(tpl_path, task_tpl)
 
     def worker():
         try:
-            generate_notices(
-                task_tpl, data_rows, manual_fields,
+            generate_notices_html(
+                template, data_rows,
+                manual_fields=manual_fields,
                 filename_fields=filename_fields,
                 group_by_field=group_by_field,
-                output_format=output_format,
                 task_id=task_id,
                 render_workers=profile["render_workers"],
-                convert_workers=profile["convert_workers"],
-                pdf_chunk_size=profile["pdf_chunk_size"],
                 profile_label=profile["label"],
             )
         except Exception as e:
@@ -819,11 +1963,6 @@ def generate():
                          error=f"{e.__class__.__name__}: {e}",
                          message=f"Generation failed: {e}")
         finally:
-            try:
-                os.remove(task_tpl)
-            except OSError:
-                pass
-            # Session files served their purpose; clean them up.
             shutil.rmtree(os.path.join(UPLOAD_DIR, sid), ignore_errors=True)
 
     threading.Thread(target=worker, daemon=True).start()
@@ -883,7 +2022,331 @@ def download_part(task_id, part_index):
                      as_attachment=True, download_name=part["name"])
 
 
-# ── HTML template ────────────────────────────────────────────────
+# ── template editor / preview (task 15) ─────────────────────────
+
+PREVIEW_SAMPLE_DATA = {
+    "date": "15/04/2026", "name": "Ali Hassan",
+    "cnic": "4210112345678", "phone": "0300-1234567",
+    "disb_date": "01/12/2025", "Due_date": "15/02/2026",
+    "Principal_Amount": "50,000.00", "Interest": "2,500.00",
+    "Penalty": "500.00", "Payable": "53,000.00",
+    "Transaction_id": "TX100001", "easypaisa_account": "EP-0001",
+}
+
+
+def _build_preview_html(sample=None, security_config=None, template=None,
+                        fill_placeholders=False, strip_unfilled=None):
+    """Render the base template with the given template's blocks, assets,
+    and security overlay. Preview matches the final PDF because we reuse
+    build_notice_html — the same function the rendering pipeline uses.
+
+    `fill_placeholders` defaults to False so the iframe preview shows the
+    bare template with literal `{{placeholder}}` tokens. Set True to get
+    a sample-data or manual-form partial-fill render.
+    `strip_unfilled` defaults to `fill_placeholders`; pass False for a
+    partial fill that keeps un-typed `{{foo}}` visible."""
+    sample = sample if sample is not None else PREVIEW_SAMPLE_DATA
+    if template is None:
+        template = load_template("default")
+    else:
+        template = dict(template)  # don't mutate caller's dict
+    if security_config is not None:
+        template["security"] = security_config
+    return build_notice_html(template, sample, base_html=None,
+                             static_dir=TEMPLATE_STATIC_DIR,
+                             manual_fields=None,
+                             fill_placeholders=fill_placeholders,
+                             strip_unfilled=strip_unfilled)
+
+
+@app.route("/preview.html")
+def preview_html():
+    """Live preview iframe (GET). Takes ?slug=<template_slug> (defaults
+    to 'default') and renders the template WITHOUT filling placeholders
+    — you see literal `{{name}}` etc. so the iframe shows the template,
+    not a sample. Pass ?fill=1 to substitute sample data instead."""
+    slug = (request.args.get("slug") or "default").strip()
+    fill = request.args.get("fill", "0").lower() in ("1", "true", "yes")
+    tpl = load_template(slug) or load_template("default")
+    cfg = tpl.get("security") or load_default_security()
+    html = _build_preview_html(
+        security_config=cfg, template=tpl, fill_placeholders=fill)
+    resp = Response(html, mimetype="text/html")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/preview_html", methods=["POST"])
+def api_preview_html():
+    """Live-preview endpoint for unsaved sidebar state.
+
+    Body JSON: {slug, blocks?, security?, assets_config?, fields?}.
+      - `slug` picks the on-disk template as base (for uploaded PNGs).
+      - `blocks` / `security` / `assets_config` override currently
+        persisted values for the in-memory preview.
+      - `fields` is an optional dict of placeholder values from the
+        Manual-single form. When present, the preview switches to
+        partial-fill mode (substitute those keys, leave others as
+        literal `{{placeholders}}`)."""
+    payload = request.get_json(silent=True) or {}
+    slug = (payload.get("slug") or "default").strip()
+    tpl = load_template(slug) or load_template("default")
+    if payload.get("blocks") is not None:
+        incoming = payload["blocks"]
+        merged_blocks = dict(tpl.get("blocks") or {})
+        for p in EDITABLE_PURPOSES:
+            if p in incoming:
+                merged_blocks[p] = incoming[p]
+        tpl["blocks"] = merged_blocks
+    if payload.get("security") is not None:
+        tpl["security"] = _merge_security_config(payload["security"])
+    if payload.get("assets_config") is not None:
+        tpl["assets_config"] = _merge_assets_config(payload["assets_config"])
+
+    fields = payload.get("fields")
+    if fields:
+        # Partial-fill: substitute provided keys, keep others literal.
+        html = _build_preview_html(
+            sample=fields, template=tpl,
+            fill_placeholders=True, strip_unfilled=False)
+    else:
+        # Bare template preview — keep all {{...}} literal.
+        html = _build_preview_html(template=tpl, fill_placeholders=False)
+    resp = Response(html, mimetype="text/html")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/editor", methods=["GET"])
+def editor():
+    """Deprecated — the old standalone editor. Redirect to the unified
+    workstation, which now contains all editing controls."""
+    return redirect("/")
+
+
+@app.route("/api/security", methods=["GET", "POST"])
+def api_security():
+    """Shortcut for default-template security (back-compat)."""
+    if request.method == "GET":
+        return jsonify(load_default_security())
+    payload = request.get_json(silent=True) or {}
+    merged = save_default_security(payload)
+    save_template("S&S Law Firm — Default", security=merged,
+                  overwrite_slug="default")
+    return jsonify(ok=True, config=merged)
+
+
+# ── template CRUD API (task 17) ─────────────────────────────────
+
+@app.route("/api/templates/<slug>", methods=["GET"])
+def api_template_get(slug):
+    tpl = load_template(slug)
+    if tpl is None:
+        return jsonify(error=f"template '{slug}' not found"), 404
+    return jsonify(_template_public(tpl))
+
+
+@app.route("/api/templates/<slug>", methods=["PUT"])
+def api_template_put(slug):
+    """Update blocks / security / assets_config / name of an existing
+    template (or the built-in default). Body JSON: {name?, blocks?,
+    security?, assets_config?}."""
+    tpl = load_template(slug)
+    if tpl is None:
+        return jsonify(error=f"template '{slug}' not found"), 404
+    payload = request.get_json(silent=True) or {}
+    name = payload.get("name") or tpl.get("name")
+    blocks = payload.get("blocks")
+    security = payload.get("security")
+    assets_config = payload.get("assets_config")
+    try:
+        save_template(name, blocks=blocks, security=security,
+                      assets_config=assets_config, overwrite_slug=slug)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    return jsonify(ok=True, template=_template_public(load_template(slug)))
+
+
+@app.route("/api/templates", methods=["POST"])
+def api_template_create():
+    """Create a new template. Body JSON: {name, base_slug?, blocks?,
+    security?, assets_config?}. If base_slug is given, the new template
+    starts as a copy of that one (including its assets)."""
+    payload = request.get_json(silent=True) or {}
+    name = (payload.get("name") or "").strip()
+    if not name:
+        return jsonify(error="name is required"), 400
+    base_slug = (payload.get("base_slug") or "default").strip()
+    base = load_template(base_slug)
+    if base is None:
+        return jsonify(error=f"base template '{base_slug}' not found"), 400
+
+    # Log incoming clone payload so we can diagnose "edits didn't save"
+    # reports. Blocks are truncated to keep the log readable.
+    pb = payload.get("blocks") or {}
+    print(f"[clone] name={name!r} base={base_slug!r} "
+          f"blocks_keys={sorted(pb.keys())} "
+          f"sample notice-subject={str(pb.get('notice-subject',''))[:40]!r}")
+
+    blocks = payload.get("blocks") or base.get("blocks")
+    security = payload.get("security") or base.get("security")
+    assets_config = payload.get("assets_config") or base.get("assets_config")
+    try:
+        new_slug = save_template(name, blocks=blocks, security=security,
+                                 assets_config=assets_config)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+
+    # Copy assets from base to new template.
+    for kind, src in (base.get("assets") or {}).items():
+        if not src or not os.path.isfile(src):
+            continue
+        dst_dir = os.path.join(TEMPLATES_ROOT, new_slug, "assets")
+        os.makedirs(dst_dir, exist_ok=True)
+        shutil.copy(src, os.path.join(dst_dir, f"{kind}.png"))
+
+    return jsonify(ok=True,
+                   template=_template_public(load_template(new_slug)))
+
+
+@app.route("/api/templates/<slug>", methods=["DELETE"])
+def api_template_delete(slug):
+    try:
+        ok = delete_template(slug)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    return jsonify(ok=ok)
+
+
+@app.route("/api/templates/<slug>/assets/<kind>", methods=["POST", "DELETE"])
+def api_template_asset(slug, kind):
+    if kind not in ASSET_KINDS:
+        return jsonify(error=f"unknown asset kind: {kind}"), 400
+    if load_template(slug) is None:
+        return jsonify(error=f"template '{slug}' not found"), 404
+    if request.method == "DELETE":
+        delete_template_asset(slug, kind)
+        return jsonify(ok=True)
+    f = request.files.get("file")
+    if not f:
+        return jsonify(error="no file uploaded (expected field 'file')"), 400
+    # Bump meta.updated so the frontend can invalidate caches.
+    try:
+        save_template_asset(slug, kind, f)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    save_template(load_template(slug).get("name"), overwrite_slug=slug)
+    return jsonify(ok=True, kind=kind)
+
+
+def _template_public(tpl):
+    """Strip filesystem paths from a template's assets dict before
+    sending to the client. The UI only needs to know WHICH slots have
+    overrides — it renders images via /api/templates/<slug>/assets/<kind>."""
+    if tpl is None:
+        return None
+    return {
+        "slug": tpl["slug"],
+        "name": tpl["name"],
+        "builtin": tpl.get("builtin", False),
+        "blocks": tpl.get("blocks") or {},
+        "security": tpl.get("security") or {},
+        "assets": {k: bool(tpl.get("assets", {}).get(k)) for k in ASSET_KINDS},
+        "assets_config": tpl.get("assets_config") or DEFAULT_ASSETS_CONFIG,
+    }
+
+
+@app.route("/api/templates/<slug>/assets/<kind>", methods=["GET"])
+def api_template_asset_image(slug, kind):
+    """Serve a template's asset image (with fallback to the default's
+    shipped asset if this template hasn't overridden it)."""
+    if kind not in ASSET_KINDS:
+        return jsonify(error="unknown kind"), 400
+    # per-template override first
+    override = os.path.join(TEMPLATES_ROOT, slug, "assets", f"{kind}.png")
+    if os.path.isfile(override):
+        return send_file(override, mimetype="image/png")
+    # fallback: shipped default
+    defaults = {
+        "logo": "logo.png",
+        "seal": "seal_default.png",
+        "signature_seal": "signature_seal_default.png",
+    }
+    shipped = os.path.join(TEMPLATE_STATIC_DIR, "images", defaults[kind])
+    if os.path.isfile(shipped):
+        return send_file(shipped, mimetype="image/png")
+    return jsonify(error="asset not found"), 404
+
+
+@app.route("/api/templates/<slug>/placeholders")
+def api_template_placeholders(slug):
+    """List every {{placeholder}} referenced by the base HTML + the
+    template's block texts. Used by the manual-single-notice form
+    to render one input per placeholder.
+
+    Also flags which placeholders are MONEY fields (header matches
+    MONEY_KEYWORDS) so the frontend can attach a blur-time auto-format
+    handler that turns `50000` into `50,000.00`."""
+    tpl = load_template(slug)
+    if tpl is None:
+        return jsonify(error=f"template '{slug}' not found"), 404
+    placeholders = extract_template_placeholders(tpl)
+    money = [p for p in placeholders if _is_money_header(p)]
+    return jsonify(placeholders=placeholders, money=money)
+
+
+@app.route("/generate_one", methods=["POST"])
+def generate_one():
+    """Render ONE notice from user-typed field values and stream the
+    PDF back immediately. Body JSON:
+      {template_slug, fields, date_value?}
+    `fields` maps placeholder-name → user value. `date_value` (ISO
+    YYYY-MM-DD from the date picker) overrides `fields["date"]` with
+    DD/MM/YYYY formatting. Response is a `application/pdf` attachment."""
+    payload = request.get_json(silent=True) or {}
+    slug = (payload.get("template_slug") or "default").strip()
+    tpl = load_template(slug)
+    if tpl is None:
+        return jsonify(error=f"template '{slug}' not found"), 400
+    fields = dict(payload.get("fields") or {})
+    date_value = (payload.get("date_value") or "").strip()
+    if date_value:
+        try:
+            d = datetime.date.fromisoformat(date_value)
+            fields["date"] = d.strftime("%d/%m/%Y")
+        except ValueError:
+            pass
+
+    safe_name = _safe_name(fields.get("name") or "notice") or "notice"
+    tmp = tempfile.mkdtemp(prefix="notice_one_")
+    try:
+        out_pdf = os.path.join(tmp, "notice.pdf")
+        render_notice_row_pdf(tpl, fields, out_pdf,
+                              rasterize=True, lock=True)
+        with open(out_pdf, "rb") as f:
+            data = f.read()
+    except Exception as e:
+        traceback.print_exc()
+        shutil.rmtree(tmp, ignore_errors=True)
+        return jsonify(error=f"{e.__class__.__name__}: {e}"), 500
+    shutil.rmtree(tmp, ignore_errors=True)
+    # HTTP headers are latin-1 only — a Chinese (or any non-ASCII) name
+    # in safe_name kills the response with a UnicodeEncodeError. Follow
+    # RFC 5987: give both an ASCII fallback filename= and a UTF-8
+    # filename*= that modern browsers prefer.
+    from urllib.parse import quote
+    ascii_fallback = safe_name.encode("ascii", "ignore").decode() or "notice"
+    disp = (f'attachment; filename="{ascii_fallback}.pdf"; '
+            f"filename*=UTF-8''{quote(safe_name + '.pdf')}")
+    return Response(
+        data, mimetype="application/pdf",
+        headers={
+            "Content-Disposition": disp,
+            "Cache-Control": "no-store",
+        })
+
+
+# ── HTML template (unified single-page workstation) ─────────────
 
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -891,462 +2354,1135 @@ HTML_TEMPLATE = r"""
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>S&amp;S Law Firm — Legal Notice Generator</title>
+<title>S&amp;S Law Firm — Legal Notice Workstation</title>
 <link rel="icon" type="image/png" href="__LOGO_DATA_URI__">
 <style>
-  :root { --primary: #2563eb; --danger: #dc2626; --success: #16a34a;
-          --bg: #f8fafc; --card: #fff; --brand: #0b1220; --brand-accent: #c9a14a; }
+  :root { --primary: #0b1220; --accent: #c9a14a;
+          --danger: #dc2626; --success: #16a34a;
+          --bg: #f4f1ea; --panel: #fff; --border: #e0dcd2; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, "Segoe UI", Roboto, "PingFang SC", sans-serif;
-         background: var(--bg); color: #1e293b; line-height: 1.6; }
+  html, body { height: 100vh; overflow: hidden; }
+  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+         background: var(--bg); color: #111; line-height: 1.45;
+         font-size: 13px; }
 
-  .brand-bar { background: linear-gradient(180deg, #0b1220 0%, #111a2e 100%);
-               border-bottom: 3px solid var(--brand-accent);
-               box-shadow: 0 2px 12px rgba(0,0,0,.18);
-               position: relative; }
-  .brand-inner { max-width: 860px; margin: 0 auto; padding: 28px 16px 24px;
-                 display: flex; flex-direction: column; align-items: center; gap: 10px; }
-  .brand-logout { position: absolute; top: 14px; right: 18px;
-                  color: #cbd5e1; text-decoration: none; font-size: .72rem;
-                  letter-spacing: .1em; text-transform: uppercase;
-                  padding: 6px 12px; border: 1px solid rgba(201,161,74,.35);
-                  border-radius: 4px; transition: .2s; }
-  .brand-logout:hover { color: #c9a14a; border-color: #c9a14a;
-                        background: rgba(201,161,74,.08); }
-  .brand-logo { max-width: 340px; width: 82%; height: auto; display: block;
-                filter: drop-shadow(0 2px 8px rgba(0,0,0,.35)); }
-  .brand-tagline { color: #cbd5e1; font-size: .82rem; letter-spacing: .18em;
-                   text-transform: uppercase; font-weight: 500;
-                   border-top: 1px solid rgba(201,161,74,.35); padding-top: 10px;
-                   margin-top: 4px; }
-  .brand-tagline span { color: var(--brand-accent); }
+  /* ── Top brand bar ── */
+  .brand { background: linear-gradient(180deg, #0b1220 0%, #111a2e 100%);
+           border-bottom: 2px solid var(--accent);
+           padding: 10px 20px; display: flex; align-items: center;
+           gap: 14px; height: 56px; }
+  .brand .logo { height: 32px; width: auto;
+                 filter: drop-shadow(0 1px 3px rgba(0,0,0,.3)); }
+  .brand .name { color: #fff; font-size: 1rem; font-weight: 700;
+                 letter-spacing: .02em; }
+  .brand .sub { color: #cbd5e1; font-size: .72rem;
+                text-transform: uppercase; letter-spacing: .14em;
+                margin-left: 4px; }
+  .brand .spacer { flex: 1; }
+  .brand a { color: #cbd5e1; text-decoration: none; font-size: .72rem;
+             letter-spacing: .12em; text-transform: uppercase;
+             padding: 6px 10px; border: 1px solid rgba(201,161,74,.3);
+             border-radius: 4px; transition: .15s; }
+  .brand a:hover { color: var(--accent); border-color: var(--accent);
+                    background: rgba(201,161,74,.08); }
 
-  .container { max-width: 860px; margin: 0 auto; padding: 32px 16px; }
-  h1 { text-align: center; font-size: 1.5rem; margin-bottom: 6px; color: #0b1220;
-       letter-spacing: .01em; }
-  .subtitle { text-align: center; color: #64748b; margin-bottom: 32px; font-size: .92rem; }
+  /* ── 2-column layout ── */
+  .layout { display: grid; grid-template-columns: 420px 1fr;
+            height: calc(100vh - 56px); }
+  .sidebar { background: var(--panel); border-right: 1px solid var(--border);
+             overflow-y: auto; padding: 12px 16px 40px; }
+  .preview { background: #e8e4d9; overflow: auto; }
+  .preview iframe { width: 100%; height: 100%; border: 0; background: #fff; }
 
-  .card { background: var(--card); border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.08);
-          padding: 24px; margin-bottom: 20px; }
-  .card h2 { font-size: 1.1rem; margin-bottom: 16px; color: #334155; }
+  /* ── Collapsible sections ── */
+  details { border: 1px solid var(--border); border-radius: 6px;
+            margin-bottom: 10px; background: #fcfaf5; overflow: hidden; }
+  details[open] { background: #fff; }
+  summary { list-style: none; cursor: pointer; padding: 10px 12px;
+            font-weight: 700; font-size: .84rem; color: #222;
+            display: flex; align-items: center; gap: 8px;
+            letter-spacing: .01em; user-select: none; }
+  summary::-webkit-details-marker { display: none; }
+  summary::before { content: "▶"; font-size: .7rem; color: #888;
+                    transition: transform .15s; }
+  details[open] summary::before { transform: rotate(90deg); }
+  summary .hint { margin-left: auto; font-weight: 400; font-size: .72rem;
+                  color: #888; }
+  .section-body { padding: 0 12px 12px; }
 
-  .upload-area { border: 2px dashed #cbd5e1; border-radius: 8px; padding: 20px;
-                 text-align: center; cursor: pointer; transition: .2s; min-height: 80px;
-                 display: flex; align-items: center; justify-content: center; flex-direction: column; }
-  .upload-area:hover { border-color: var(--primary); background: #eff6ff; }
-  .upload-area.has-file { border-color: var(--success); background: #f0fdf4; }
-  .upload-area input[type="file"] { display: none; }
-  .upload-area .label { font-size: .95rem; color: #64748b; }
-  .upload-area .filename { font-weight: 600; color: var(--success); }
+  /* ── Form controls ── */
+  .field { margin-bottom: 10px; }
+  .field label { display: block; font-weight: 600; font-size: .76rem;
+                 color: #333; margin-bottom: 3px; }
+  .field input[type=text], .field input[type=date],
+  .field input[type=number], .field input[type=password],
+  .field select, .field textarea {
+    width: 100%; padding: 6px 9px; border: 1px solid #cbd5e1;
+    border-radius: 5px; font-size: .84rem; font-family: inherit; }
+  .field textarea { min-height: 64px; resize: vertical; line-height: 1.5; }
+  .field textarea.big { min-height: 110px; }
+  .field textarea.huge { min-height: 180px; }
+  .field input:focus, .field select:focus, .field textarea:focus {
+    outline: none; border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(201,161,74,.18); }
+  .field .hint { font-size: .7rem; color: #888; margin-top: 3px;
+                 line-height: 1.35; }
+  .field .row { display: grid; grid-template-columns: 1fr auto;
+                align-items: center; gap: 8px; }
+  .field .out { font-family: ui-monospace, Menlo, monospace;
+                font-size: .72rem; color: #555; min-width: 42px;
+                text-align: right; }
+  .field input[type=range] { width: 100%; accent-color: var(--accent); }
+  .field input[type=color] { width: 100%; height: 30px; padding: 0;
+                             border: 1px solid #cbd5e1; border-radius: 5px; }
+  .toggle { display: flex; align-items: center; gap: 8px;
+            font-size: .82rem; font-weight: 600; color: #111;
+            cursor: pointer; margin-bottom: 8px; }
+  .toggle input { width: 14px; height: 14px; accent-color: var(--accent); }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 
-  .row { display: flex; gap: 16px; flex-wrap: wrap; }
-  .row > * { flex: 1; min-width: 0; }
+  /* ── Image upload slot ── */
+  .img-slot { display: grid; grid-template-columns: 64px 1fr;
+              gap: 10px; padding: 8px; border: 1px solid var(--border);
+              border-radius: 6px; margin-bottom: 8px; align-items: center;
+              background: #fafaf7; }
+  .img-slot img { width: 64px; height: 64px; object-fit: contain;
+                  background: #fff; border: 1px solid #e5e5e5;
+                  border-radius: 4px; }
+  .img-slot .meta .kind { font-weight: 700; font-size: .8rem; }
+  .img-slot .meta .sub { font-size: .68rem; color: #888; line-height: 1.3; }
+  .img-slot .meta .btns { margin-top: 5px; display: flex; gap: 6px; }
+  .img-slot .meta label.btn-file {
+    padding: 4px 10px; font-size: .72rem; background: #f1efe9;
+    border: 1px solid #d6d2c9; border-radius: 4px; cursor: pointer; }
+  .img-slot .meta label.btn-file:hover { background: #e8e4d9; }
+  .img-slot .meta .reset { padding: 4px 8px; font-size: .72rem;
+                           background: transparent; border: 1px solid #e5e5e5;
+                           color: #888; border-radius: 4px; cursor: pointer; }
+  .img-slot .meta .placement-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 4px 8px;
+    margin-top: 7px;
+  }
+  .img-slot .meta .placement-grid label {
+    font-size: .66rem; color: #666; display: flex; flex-direction: column;
+    gap: 2px;
+  }
+  .img-slot .meta .placement-grid input[type="number"] {
+    padding: 3px 5px; font-size: .78rem; border: 1px solid var(--border);
+    border-radius: 3px; background: #fff; width: 100%;
+  }
 
-  .btn { display: inline-block; padding: 10px 28px; border: none; border-radius: 8px;
-         font-size: 1rem; font-weight: 600; cursor: pointer; transition: .2s; }
+  /* ── Buttons ── */
+  .btn { display: inline-block; padding: 7px 13px; border: none;
+         border-radius: 5px; font-size: .82rem; font-weight: 600;
+         cursor: pointer; transition: .12s; line-height: 1.2; }
   .btn-primary { background: var(--primary); color: #fff; }
-  .btn-primary:hover { background: #1d4ed8; }
-  .btn-primary:disabled { background: #94a3b8; cursor: not-allowed; }
-  .btn-block { width: 100%; text-align: center; }
+  .btn-primary:hover:not(:disabled) { background: #1a2541; }
+  .btn-primary:disabled { background: #9ca3af; cursor: not-allowed; }
+  .btn-secondary { background: #f1efe9; color: #333;
+                   border: 1px solid #d6d2c9; }
+  .btn-secondary:hover { background: #e8e4d9; }
+  .btn-danger:disabled,
+  .btn-secondary:disabled { opacity: .4; cursor: not-allowed; }
 
-  .tag { display: inline-block; padding: 2px 10px; border-radius: 999px;
-         font-size: .82rem; margin: 2px 4px; }
+  /* ── Generate-mode radio toggle (Excel vs Manual) ── */
+  .mode-toggle {
+    display: flex; gap: 4px; margin-bottom: 12px;
+    background: #f1efe9; border: 1px solid var(--border);
+    border-radius: 5px; padding: 3px;
+  }
+  .mode-toggle label {
+    flex: 1; text-align: center; font-size: .78rem;
+    padding: 5px 8px; border-radius: 4px; cursor: pointer;
+    font-weight: 600; color: #555; user-select: none;
+  }
+  .mode-toggle input[type="radio"] { display: none; }
+  .mode-toggle input[type="radio"]:checked + span,
+  .mode-toggle label:has(input:checked) {
+    background: var(--primary); color: #fff;
+  }
+
+  /* ── Manual-single placeholder grid ── */
+  #manualFieldGrid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 6px 8px;
+    margin-bottom: 12px;
+  }
+  #manualFieldGrid .field { margin: 0; }
+  #manualFieldGrid .field.full { grid-column: 1 / -1; }
+  #manualFieldGrid .field label {
+    font-family: ui-monospace, "SF Mono", "Menlo", "Consolas", monospace;
+    font-size: .7rem; color: #555; margin-bottom: 2px;
+  }
+  #manualFieldGrid .field input {
+    padding: 5px 7px; font-size: .82rem;
+    border: 1px solid var(--border); border-radius: 4px;
+    background: #fff; width: 100%;
+  }
+  #manualFieldGrid .field input[readonly] {
+    background: #f5f1e6; color: #555; cursor: not-allowed;
+    font-weight: 700;
+  }
+  #manualFieldGrid .field .auto-tag {
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: .62rem; font-weight: 500;
+    color: #8a7a3a; margin-left: 4px;
+    text-transform: none; letter-spacing: 0;
+  }
+
+  .btn-danger { background: #fef2f2; color: var(--danger);
+                border: 1px solid #fecaca; }
+  .btn-danger:hover { background: #fee2e2; }
+  .btn-block { width: 100%; text-align: center; }
+  .btn-row { display: flex; gap: 6px; flex-wrap: wrap; }
+
+  /* ── Tags & info ── */
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 999px;
+         font-size: .72rem; margin: 2px 2px; }
   .tag-ok { background: #dcfce7; color: #166534; }
   .tag-miss { background: #fee2e2; color: #991b1b; }
-
-  .field-group { margin-bottom: 12px; }
-  .field-group label { display: block; font-weight: 500; margin-bottom: 4px; font-size: .9rem; }
-  .field-group input[type="text"], .field-group select {
-    width: 100%; padding: 8px 12px; border: 1px solid #cbd5e1; border-radius: 6px;
-    font-size: .95rem; }
-  .field-group input[type="text"]:focus, .field-group select:focus {
-    outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(37,99,235,.15); }
-  .field-group .hint { font-size: .78rem; color: #94a3b8; margin-top: 4px; }
-
-  .check-grid { display: flex; flex-wrap: wrap; gap: 6px 14px; padding: 8px 12px;
-                border: 1px solid #cbd5e1; border-radius: 6px; max-height: 140px;
-                overflow-y: auto; background: #fff; }
-  .check-grid label { font-size: .88rem; font-weight: 400; display: inline-flex;
-                      align-items: center; gap: 4px; cursor: pointer; margin: 0; }
-  .check-grid input[type="checkbox"] { margin: 0; }
-
-  .info-box { padding: 12px 16px; border-radius: 8px; font-size: .9rem; margin-bottom: 16px; }
+  .info { padding: 8px 12px; border-radius: 5px; font-size: .78rem;
+          margin: 8px 0; line-height: 1.4; }
   .info-ok { background: #f0fdf4; border: 1px solid #bbf7d0; color: #166534; }
   .info-warn { background: #fffbeb; border: 1px solid #fde68a; color: #92400e; }
+  .info-err { background: #fef2f2; border: 1px solid #fecaca; color: #991b1b; }
 
-  table.preview { width: 100%; border-collapse: collapse; font-size: .85rem; margin-top: 8px; }
-  table.preview th, table.preview td { padding: 6px 10px; border: 1px solid #e2e8f0; text-align: left; }
-  table.preview th { background: #f1f5f9; font-weight: 600; }
+  .check-grid { display: flex; flex-wrap: wrap; gap: 4px 12px;
+                padding: 8px 10px; border: 1px solid #cbd5e1;
+                border-radius: 5px; max-height: 100px; overflow-y: auto;
+                background: #fff; }
+  .check-grid label { font-size: .76rem; font-weight: 400; margin: 0;
+                      display: inline-flex; align-items: center; gap: 4px;
+                      cursor: pointer; }
 
-  .progress-wrap { margin-top: 16px; }
-  .progress-bar { width: 100%; height: 10px; background: #e2e8f0; border-radius: 999px; overflow: hidden; }
-  .progress-fill { height: 100%; background: var(--primary); width: 0%; transition: width .3s ease; }
-  .progress-text { font-size: .85rem; color: #64748b; margin-top: 6px; text-align: center; }
+  table.preview { width: 100%; border-collapse: collapse;
+                  font-size: .72rem; margin-top: 4px; }
+  table.preview th, table.preview td { padding: 3px 6px;
+                  border: 1px solid #e2e8f0; text-align: left;
+                  white-space: nowrap; max-width: 120px;
+                  overflow: hidden; text-overflow: ellipsis; }
+  table.preview th { background: #f1efe9; font-weight: 600; }
 
-  .spinner { display: inline-block; width: 18px; height: 18px; border: 2px solid #fff;
-             border-top-color: transparent; border-radius: 50%;
-             animation: spin .6s linear infinite; vertical-align: middle; margin-right: 8px; }
+  /* ── Progress ── */
+  .progress-bar { width: 100%; height: 8px; background: #e2e8f0;
+                  border-radius: 999px; overflow: hidden; margin-top: 8px; }
+  .progress-fill { height: 100%; background: var(--primary);
+                   width: 0%; transition: width .3s ease; }
+  .progress-text { font-size: .74rem; color: #666; margin-top: 4px;
+                   line-height: 1.3; }
+
+  .spinner { display: inline-block; width: 14px; height: 14px;
+             border: 2px solid #fff; border-top-color: transparent;
+             border-radius: 50%; animation: spin .6s linear infinite;
+             vertical-align: middle; margin-right: 6px; }
   @keyframes spin { to { transform: rotate(360deg); } }
+  .status-msg { font-size: .72rem; color: #666; margin-top: 5px;
+                line-height: 1.35; }
+  .status-msg.ok { color: var(--success); }
+  .status-msg.err { color: var(--danger); }
 
-  .step-num { display: inline-flex; align-items: center; justify-content: center;
-              width: 28px; height: 28px; border-radius: 50%; background: var(--primary);
-              color: #fff; font-weight: 700; font-size: .85rem; margin-right: 8px; }
+  code { background: #f1efe9; padding: 0 3px; border-radius: 3px;
+         font-family: ui-monospace, Menlo, monospace; font-size: .82em; }
 </style>
 </head>
 <body>
-<header class="brand-bar">
-  <a class="brand-logout" href="/logout">Sign Out</a>
-  <div class="brand-inner">
-    <img class="brand-logo" src="__LOGO_DATA_URI__" alt="S&amp;S Law Firm">
-    <div class="brand-tagline">Batch <span>Legal Notice</span> Generator</div>
-  </div>
+
+<header class="brand">
+  <img class="logo" src="__LOGO_DATA_URI__" alt="S&amp;S Law Firm">
+  <span class="name">S&amp;S LAW FIRM</span>
+  <span class="sub">Legal Notice Workstation</span>
+  <span class="spacer"></span>
+  <a href="/logout">Sign Out</a>
 </header>
-<div class="container">
-  <h1>Legal Notice Generator</h1>
-  <p class="subtitle">Upload a docx template and Excel data to batch-generate legal notices</p>
 
-  <!-- Step 1: Upload -->
-  <div class="card">
-    <h2><span class="step-num">1</span>Upload Files</h2>
-    <div class="row" style="margin-bottom:16px;">
-      <div class="upload-area" id="tplArea" onclick="document.getElementById('tplFile').click()">
-        <input type="file" id="tplFile" accept=".docx">
-        <div class="label" id="tplLabel">Click to select <b>docx template</b></div>
+<div class="layout">
+
+<aside class="sidebar">
+
+  <!-- ═══ Section 1 · Template ═══ -->
+  <details open>
+    <summary>Template <span class="hint" id="templateHint"></span></summary>
+    <div class="section-body">
+      <div class="field">
+        <label>Active template</label>
+        <div class="row" style="grid-template-columns: 1fr auto;">
+          <select id="templateSlug"></select>
+          <button class="btn btn-danger" id="tplDeleteBtn" onclick="deleteTemplate()" title="Delete this template">Delete</button>
+        </div>
       </div>
-      <div class="upload-area" id="xlsArea" onclick="document.getElementById('xlsFile').click()">
-        <input type="file" id="xlsFile" accept=".xlsx,.xls">
-        <div class="label" id="xlsLabel">Click to select <b>Excel data</b></div>
+      <div class="field">
+        <label>Template name</label>
+        <input type="text" id="templateName">
       </div>
-    </div>
-    <button class="btn btn-primary btn-block" id="uploadBtn" onclick="doUpload()" disabled>
-      Analyze Files
-    </button>
-  </div>
-
-  <!-- Step 2: Analysis -->
-  <div class="card" id="step2" style="display:none">
-    <h2><span class="step-num">2</span>Placeholder Matching</h2>
-
-    <div id="matchInfo"></div>
-    <div id="placeholderTags"></div>
-
-    <div id="manualSection" style="display:none; margin-top:20px;">
-      <h2 style="color:var(--danger); margin-bottom:12px;">Fields requiring manual input (applied to all rows)</h2>
-      <div id="manualFields"></div>
-    </div>
-
-    <div id="previewSection" style="margin-top: 20px;">
-      <h2 style="margin-bottom:8px;">Excel Data Preview (first 5 rows)</h2>
-      <div style="overflow-x:auto;" id="previewTable"></div>
-    </div>
-  </div>
-
-  <!-- Step 3: Generate -->
-  <div class="card" id="step3" style="display:none">
-    <h2><span class="step-num">3</span>Generate Notices</h2>
-
-    <div class="field-group" id="dateSection" style="display:none">
-      <label>Notice Date &mdash; used for &#123;&#123;date&#125;&#125; (always overrides any Excel column)</label>
-      <input type="date" id="dateValue">
-      <div class="hint">Output format: DD/MM/YYYY. Any <code>date</code> column in your Excel is ignored.</div>
-    </div>
-
-    <div class="field-group">
-      <label>File Naming &mdash; pick one or more Excel columns (joined by _)</label>
-      <div class="check-grid" id="filenameFields"></div>
-      <div class="hint">If none selected, files are numbered sequentially.</div>
-    </div>
-
-    <div class="row">
-      <div class="field-group">
-        <label>Group By</label>
-        <select id="groupByField">
-          <option value="">No grouping (single output.zip)</option>
-        </select>
-        <div class="hint">When set, rows are sorted by this column and each group is downloaded as its own zip as soon as it's ready.</div>
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="renameTemplate()">Rename</button>
+        <button class="btn btn-secondary" onclick="cloneAsNew()">Save as new…</button>
+        <button class="btn btn-primary" onclick="reloadTemplate()">Reload</button>
       </div>
-      <div class="field-group">
-        <label>Output Format</label>
-        <select id="outputFormat">
-          <option value="docx" selected>DOCX (default)</option>
-          <option value="pdf">PDF</option>
-        </select>
+      <div class="status-msg" id="tplStatus"></div>
+    </div>
+  </details>
+
+  <!-- ═══ Section 2 · Body content ═══ -->
+  <details>
+    <summary>Body Content <span class="hint">7 editable blocks</span></summary>
+    <div class="section-body">
+      <div class="field">
+        <label><code>letterhead-firm</code> — firm name (line 1) + tag (line 2)</label>
+        <textarea id="bk-letterhead-firm" class="big"></textarea>
       </div>
+      <div class="field">
+        <label><code>letterhead-partners</code> — one partner per line, format: <code>Name | Role</code></label>
+        <textarea id="bk-letterhead-partners" class="big"></textarea>
+      </div>
+      <div class="field">
+        <label><code>notice-subject</code> — subject line</label>
+        <textarea id="bk-notice-subject" class="big"></textarea>
+      </div>
+      <div class="field">
+        <label><code>notice-body-text</code> — main narrative (paragraphs split by blank line; <code>[[AMOUNTS_TABLE]]</code> and <code>[[CALLOUT]]</code> are magic markers)</label>
+        <textarea id="bk-notice-body-text" class="huge"></textarea>
+      </div>
+      <div class="field">
+        <label><code>legal-consequences</code> — one consequence per line</label>
+        <textarea id="bk-legal-consequences" class="huge"></textarea>
+      </div>
+      <div class="field">
+        <label><code>payment-instructions</code> — paragraphs split by blank line</label>
+        <textarea id="bk-payment-instructions" class="big"></textarea>
+      </div>
+      <div class="field">
+        <label><code>page-footer</code> — one line per <code>&lt;p&gt;</code>; <code>Office:</code> / <code>Email:</code> / <code>Phone:</code> auto-bolded</label>
+        <textarea id="bk-page-footer" class="big"></textarea>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="resetBlocks()">Reset to defaults</button>
+        <button class="btn btn-primary" onclick="saveBlocks()">Save body</button>
+      </div>
+      <div class="status-msg" id="blocksStatus"></div>
     </div>
+  </details>
 
-    <div class="field-group">
-      <label>Machine Profile</label>
-      <select id="machineProfile">
-        <option value="vps" selected>VPS &mdash; conservative (default)</option>
-        <option value="mac">Mac &mdash; max performance (all cores)</option>
-      </select>
-      <div class="hint">Pick &ldquo;Mac&rdquo; only when running locally on a powerful multi-core machine. It enables process-pool rendering and uses every core &mdash; much faster for DOCX output, but heavier on the box.</div>
+  <!-- ═══ Section 3 · Images ═══ -->
+  <details>
+    <summary>Images <span class="hint">upload · size · offset · rotation</span></summary>
+    <div class="section-body">
+      <div id="imageSlots"></div>
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="resetAssetsConfig()">Reset placement</button>
+        <button class="btn btn-primary" onclick="saveAssetsConfig()">Save placement</button>
+      </div>
+      <div class="status-msg" id="assetsStatus"></div>
     </div>
+  </details>
 
-    <br>
-    <button class="btn btn-primary btn-block" id="genBtn" onclick="doGenerate()">
-      Generate Notices
-    </button>
+  <!-- ═══ Section 4 · Watermark & pattern ═══ -->
+  <details>
+    <summary>Watermark &amp; Pattern <span class="hint">anti-counterfeit</span></summary>
+    <div class="section-body">
+      <label class="toggle">
+        <input type="checkbox" id="wm-enabled"> Enable watermark
+      </label>
+      <div class="field">
+        <label>English text (use <code>{name}</code>)</label>
+        <textarea id="wm-en"></textarea>
+      </div>
+      <div class="field">
+        <label>Urdu text (use <code>{name}</code>)</label>
+        <textarea id="wm-ur" dir="auto"></textarea>
+      </div>
+      <div class="row2">
+        <div class="field">
+          <label>Font size (px)</label>
+          <div class="row">
+            <input type="range" id="wm-size" min="10" max="64" step="1">
+            <span class="out" id="wm-size-out"></span>
+          </div>
+        </div>
+        <div class="field">
+          <label>Opacity (%)</label>
+          <div class="row">
+            <input type="range" id="wm-op" min="0" max="100" step="1">
+            <span class="out" id="wm-op-out"></span>
+          </div>
+        </div>
+      </div>
+      <div class="row2">
+        <div class="field">
+          <label>Count / page</label>
+          <div class="row">
+            <input type="range" id="wm-count" min="1" max="100" step="1">
+            <span class="out" id="wm-count-out"></span>
+          </div>
+        </div>
+        <div class="field">
+          <label>Ink color</label>
+          <input type="color" id="wm-color">
+        </div>
+      </div>
 
-    <div class="progress-wrap" id="progressSection" style="display:none">
-      <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
-      <div class="progress-text" id="progressText">Starting...</div>
+      <label class="toggle" style="margin-top:14px;">
+        <input type="checkbox" id="pt-enabled"> Enable pattern
+      </label>
+      <div class="row2">
+        <div class="field">
+          <label>Pattern opacity (%)</label>
+          <div class="row">
+            <input type="range" id="pt-op" min="0" max="100" step="1">
+            <span class="out" id="pt-op-out"></span>
+          </div>
+        </div>
+        <div class="field">
+          <label>Density</label>
+          <select id="pt-density">
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+            <option value="ultra">Ultra</option>
+          </select>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="resetSecurity()">Reset</button>
+        <button class="btn btn-primary" onclick="saveSecurity()">Save security</button>
+      </div>
+      <div class="status-msg" id="secStatus"></div>
     </div>
-    <div id="genStatus" style="text-align:center; margin-top:12px; color:#64748b;"></div>
-  </div>
+  </details>
+
+  <!-- ═══ Section 5 · Generate ═══ -->
+  <details open>
+    <summary>Generate <span class="hint">Excel batch · manual single</span></summary>
+    <div class="section-body">
+
+      <!-- Mode toggle — Excel batch vs manual single-notice -->
+      <div class="mode-toggle">
+        <label><input type="radio" name="gen-mode" value="excel" checked> Excel batch</label>
+        <label><input type="radio" name="gen-mode" value="manual"> Manual single</label>
+      </div>
+
+      <!-- ── EXCEL PANEL ────────────────────────────── -->
+      <div id="excelPanel">
+        <div class="field">
+          <label>Excel data file (.xlsx)</label>
+          <input type="file" id="xlsFile" accept=".xlsx,.xls">
+        </div>
+        <button class="btn btn-primary btn-block" id="analyzeBtn" onclick="doUpload()" disabled>
+          Analyze Excel
+        </button>
+
+        <div id="analysisArea" style="display:none; margin-top: 12px;">
+          <div id="matchInfo"></div>
+          <div id="placeholderTags" style="margin-bottom: 8px;"></div>
+
+          <div id="manualSection" style="display:none;">
+            <div class="info info-warn" style="margin-bottom: 6px;">
+              Fields below are not in the Excel — enter values shared across all rows.
+            </div>
+            <div id="manualFields"></div>
+          </div>
+
+          <div id="previewSection" style="display:none; margin-top: 10px;">
+            <label style="font-size:.72rem; font-weight:600; color:#555;">Data preview (first 5 rows)</label>
+            <div style="overflow-x:auto; max-height: 150px; overflow-y: auto;" id="previewTable"></div>
+          </div>
+
+          <div class="field" id="dateSection" style="display:none; margin-top:10px;">
+            <label>Notice date &mdash; overrides any <code>date</code> column</label>
+            <input type="date" id="dateValue">
+          </div>
+
+          <div class="field">
+            <label>Filename columns (joined with <code>_</code>)</label>
+            <div class="check-grid" id="filenameFields"></div>
+          </div>
+
+          <div class="row2">
+            <div class="field">
+              <label>Group by</label>
+              <select id="groupByField">
+                <option value="">No grouping</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>Machine profile</label>
+              <select id="machineProfile">
+                <option value="vps" selected>VPS — 1 worker</option>
+                <option value="mac">Mac — up to 6 workers</option>
+              </select>
+            </div>
+          </div>
+
+          <button class="btn btn-primary btn-block" id="genBtn" onclick="doGenerate()">
+            Generate Notices
+          </button>
+          <div id="progressSection" style="display:none">
+            <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+            <div class="progress-text" id="progressText">Starting…</div>
+          </div>
+          <div class="status-msg" id="genStatus"></div>
+        </div>
+      </div>
+
+      <!-- ── MANUAL PANEL — single notice ──────────── -->
+      <div id="manualPanel" style="display:none;">
+        <div class="info" style="margin-bottom:10px;">
+          Fill every placeholder below, then generate one PDF.
+          Uses the current template's saved blocks / images / watermark.
+        </div>
+        <div id="manualFieldGrid"></div>
+        <button class="btn btn-primary btn-block" id="genOneBtn" onclick="doGenerateOne()">
+          Generate single PDF
+        </button>
+        <div class="status-msg" id="genOneStatus"></div>
+      </div>
+
+    </div>
+  </details>
+
+</aside>
+
+<main class="preview">
+  <iframe id="preview" src="about:blank"></iframe>
+</main>
+
 </div>
 
 <script>
-let analysisData = null;
+let activeSlug  = 'default';
+let activeTpl   = null;
+let excelAnalysis = null;
+let previewDebounce = null;
 
-function setupFileInput(inputId, areaId, labelId) {
-  document.getElementById(inputId).addEventListener('change', function() {
-    const area = document.getElementById(areaId);
-    const label = document.getElementById(labelId);
-    if (this.files.length) {
-      area.classList.add('has-file');
-      label.innerHTML = '<span class="filename">' + this.files[0].name + '</span>';
-    }
-    checkUploadReady();
+// ── helpers ────────────────────────────────────────
+const $ = id => document.getElementById(id);
+function flash(el, msg, kind = '') {
+  el.textContent = msg;
+  el.className = 'status-msg ' + kind;
+  if (!kind || kind === 'ok')
+    setTimeout(() => { if (el.textContent === msg) el.textContent = ''; }, 2500);
+}
+function bindRange(range, out, suffix = '') {
+  const up = () => out.textContent = range.value + suffix;
+  range.addEventListener('input', up); up();
+}
+// Live preview: debounce → POST current sidebar state → srcdoc into iframe.
+// Lets the user see edits without having to press any Save button first.
+// The actual PDF render still uses saved state, so Save before Generate.
+function reloadPreview() {
+  clearTimeout(previewDebounce);
+  previewDebounce = setTimeout(async () => {
+    if (!activeTpl) return;
+    try {
+      const body = {
+        slug: activeSlug,
+        blocks: currentBlocks(),
+        security: currentSecurity(),
+        assets_config: currentAssetsConfig(),
+      };
+      // In Manual mode, also push typed placeholder values so the
+      // preview reflects them. Missing keys stay as literal {{foo}}.
+      const mp = $('manualPanel');
+      if (mp && mp.style.display !== 'none') {
+        body.fields = collectManualFields();
+      }
+      const r = await fetch('/api/preview_html', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) return;
+      $('preview').srcdoc = await r.text();
+    } catch (e) { /* ignore transient preview failures */ }
+  }, 300);
+}
+function wireStaticLivePreview() {
+  // Static elements exist at boot. Bind each once.
+  const sel = 'textarea[id^="bk-"], #wm-enabled, #wm-en, #wm-ur, #wm-size,'
+            + ' #wm-op, #wm-count, #wm-color, #pt-enabled, #pt-op, #pt-density';
+  document.querySelectorAll(sel).forEach(el => {
+    const ev = (el.type === 'checkbox' || el.tagName === 'SELECT') ? 'change' : 'input';
+    el.addEventListener(ev, reloadPreview);
+  });
+}
+function wireDynamicLivePreview() {
+  // Placement number inputs are re-created every renderImageSlots();
+  // the old DOM nodes (with their listeners) are garbage-collected, so
+  // just bind fresh each time.
+  document.querySelectorAll('[data-ac]').forEach(el => {
+    el.addEventListener('input', reloadPreview);
   });
 }
 
-setupFileInput('tplFile', 'tplArea', 'tplLabel');
-setupFileInput('xlsFile', 'xlsArea', 'xlsLabel');
-
-function checkUploadReady() {
-  const tpl = document.getElementById('tplFile').files.length > 0;
-  const xls = document.getElementById('xlsFile').files.length > 0;
-  document.getElementById('uploadBtn').disabled = !(tpl && xls);
+// ── 1. template list / active template ────────────
+async function loadTemplateList() {
+  const r = await fetch('/api/templates');
+  const items = await r.json();
+  const sel = $('templateSlug');
+  sel.innerHTML = items.map(t =>
+    `<option value="${t.slug}">${t.name}${t.builtin ? ' (built-in)' : ''}</option>`
+  ).join('');
+  if (!items.find(t => t.slug === activeSlug)) activeSlug = 'default';
+  sel.value = activeSlug;
 }
+const BLOCK_IDS = [
+  'letterhead-firm', 'letterhead-partners',
+  'notice-subject', 'notice-body-text',
+  'legal-consequences', 'payment-instructions',
+  'page-footer',
+];
+async function loadActiveTemplate() {
+  const r = await fetch('/api/templates/' + encodeURIComponent(activeSlug));
+  if (!r.ok) { alert('Failed to load template'); return; }
+  activeTpl = await r.json();
+  $('templateName').value = activeTpl.name || '';
+  $('templateHint').textContent = activeTpl.builtin ? 'built-in' : 'custom';
+  // Built-in template can't be deleted — hide the button entirely so
+  // the user never sees "Delete" next to a protected template.
+  $('tplDeleteBtn').disabled = activeTpl.builtin;
+  $('tplDeleteBtn').style.display = activeTpl.builtin ? 'none' : '';
+  // blocks
+  for (const p of BLOCK_IDS) {
+    const el = $('bk-' + p);
+    if (el) el.value = (activeTpl.blocks || {})[p] || '';
+  }
+  // security
+  const s = activeTpl.security || {};
+  const wm = s.watermark || {};
+  $('wm-enabled').checked = !!wm.enabled;
+  $('wm-en').value = wm.english_template || '';
+  $('wm-ur').value = wm.urdu_template || '';
+  $('wm-size').value = wm.font_size || 22;
+  $('wm-op').value   = wm.opacity   || 67;
+  $('wm-count').value = wm.count    || 25;
+  $('wm-color').value = wm.color   || '#323255';
+  const pt = s.pattern || {};
+  $('pt-enabled').checked = !!pt.enabled;
+  $('pt-op').value      = pt.opacity || 22;
+  $('pt-density').value = pt.density || 'medium';
+  bindRange($('wm-size'),  $('wm-size-out'),  'px');
+  bindRange($('wm-op'),    $('wm-op-out'),    '%');
+  bindRange($('wm-count'), $('wm-count-out'), '');
+  bindRange($('pt-op'),    $('pt-op-out'),    '%');
+  renderImageSlots();
+  // Refresh the manual-single placeholder grid if it's the visible mode
+  // — different templates may expose different {{placeholders}}.
+  if ($('manualPanel') && $('manualPanel').style.display !== 'none') {
+    loadManualFields();
+  }
+  reloadPreview();
+}
+$('templateSlug').addEventListener('change', async e => {
+  activeSlug = e.target.value;
+  await loadActiveTemplate();
+});
 
-async function doUpload() {
-  const btn = document.getElementById('uploadBtn');
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span>Analyzing...';
-
-  const fd = new FormData();
-  fd.append('template', document.getElementById('tplFile').files[0]);
-  fd.append('excel', document.getElementById('xlsFile').files[0]);
-
-  try {
-    const resp = await fetch('/upload', { method: 'POST', body: fd });
-    const data = await resp.json();
-    if (data.error) { alert(data.error); return; }
-    analysisData = data;
-    showAnalysis(data);
-  } catch (e) {
-    alert('Upload failed: ' + e.message);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Analyze Files';
+async function reloadTemplate() {
+  await loadTemplateList();
+  await loadActiveTemplate();
+}
+async function renameTemplate() {
+  const name = $('templateName').value.trim();
+  if (!name) return;
+  const r = await fetch('/api/templates/' + encodeURIComponent(activeSlug), {
+    method: 'PUT', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name})
+  });
+  const d = await r.json();
+  if (!r.ok) return flash($('tplStatus'), d.error || 'failed', 'err');
+  activeTpl = d.template;
+  await loadTemplateList();
+  $('templateSlug').value = activeSlug;
+  flash($('tplStatus'), 'Renamed.', 'ok');
+}
+async function cloneAsNew() {
+  const name = prompt('New template name:', ($('templateName').value || 'Template') + ' Copy');
+  if (!name) return;
+  const r = await fetch('/api/templates', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name, base_slug: activeSlug,
+                          blocks: currentBlocks(),
+                          security: currentSecurity(),
+                          assets_config: currentAssetsConfig()}),
+  });
+  const d = await r.json();
+  if (!r.ok) return flash($('tplStatus'), d.error || 'failed', 'err');
+  activeSlug = d.template.slug;
+  await loadTemplateList();
+  $('templateSlug').value = activeSlug;
+  await loadActiveTemplate();
+  flash($('tplStatus'), 'Created "' + d.template.name + '".', 'ok');
+}
+async function deleteTemplate() {
+  if (activeTpl?.builtin) return;
+  if (!confirm('Delete template "' + activeTpl.name + '"? This cannot be undone.')) return;
+  const r = await fetch('/api/templates/' + encodeURIComponent(activeSlug), {method: 'DELETE'});
+  if (r.ok) {
+    activeSlug = 'default';
+    await loadTemplateList();
+    $('templateSlug').value = 'default';
+    await loadActiveTemplate();
+    flash($('tplStatus'), 'Deleted.', 'ok');
   }
 }
 
-function showAnalysis(data) {
-  document.getElementById('step2').style.display = '';
-  document.getElementById('step3').style.display = '';
-
-  const allMatched = data.missing.length === 0;
-  const infoDiv = document.getElementById('matchInfo');
-  if (allMatched) {
-    infoDiv.innerHTML = '<div class="info-box info-ok">All ' + data.placeholders.length +
-      ' placeholders matched with Excel columns. ' + data.row_count + ' data rows found.</div>';
-  } else {
-    infoDiv.innerHTML = '<div class="info-box info-warn">' + data.matched.length + ' / ' +
-      data.placeholders.length + ' placeholders matched, ' + data.missing.length +
-      ' require manual input. ' + data.row_count + ' data rows found.</div>';
+// ── 2. body blocks ────────────────────────────────
+function currentBlocks() {
+  const out = {};
+  for (const p of BLOCK_IDS) {
+    const el = $('bk-' + p);
+    if (el) out[p] = el.value;
   }
+  return out;
+}
+async function saveBlocks() {
+  const r = await fetch('/api/templates/' + encodeURIComponent(activeSlug), {
+    method: 'PUT', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({blocks: currentBlocks()}),
+  });
+  const d = await r.json();
+  if (!r.ok) return flash($('blocksStatus'), d.error || 'failed', 'err');
+  activeTpl = d.template;
+  flash($('blocksStatus'), 'Saved body content.', 'ok');
+  reloadPreview();
+}
+async function resetBlocks() {
+  if (!confirm('Discard your block edits and reload?')) return;
+  await loadActiveTemplate();
+}
 
-  const tagsDiv = document.getElementById('placeholderTags');
-  tagsDiv.innerHTML = data.placeholders.map(function(p) {
-    const ok = data.matched.indexOf(p) !== -1;
-    return '<span class="tag ' + (ok ? 'tag-ok' : 'tag-miss') + '">&#123;&#123;' + p + '&#125;&#125;</span>';
+// ── 3. images ─────────────────────────────────────
+// Per-kind configurable placement ranges. The rotation is a BASE angle —
+// the anti-counterfeit overlay adds a per-document random ±15° on top for
+// seal and signature_seal, so even with rot=0 each PDF still gets a
+// unique jitter. Logo has no random jitter; its rot is the final angle.
+const IMG_SLOTS = [
+  {kind:'logo',           label:'Logo (top of page)',      note:'1000×1000 transparent PNG',
+   size:{min:12, max:30, step:0.5}, off:{min:-20, max:20, step:0.5}, rot:{min:-30, max:30, step:1}},
+  {kind:'seal',           label:'Firm seal (red round)',   note:'1000×1000 transparent PNG',
+   size:{min:16, max:36, step:0.5}, off:{min:-20, max:20, step:0.5}, rot:{min:-30, max:30, step:1}},
+  {kind:'signature_seal', label:'Signature seal (blue)',   note:'2000×600 transparent PNG',
+   size:{min:40, max:80, step:0.5}, off:{min:-20, max:20, step:0.5}, rot:{min:-30, max:30, step:1}},
+];
+function _acVal(kind, key, fallback) {
+  const c = (activeTpl.assets_config || {})[kind] || {};
+  const v = c[key];
+  return (v === undefined || v === null || isNaN(+v)) ? fallback : +v;
+}
+function renderImageSlots() {
+  $('imageSlots').innerHTML = IMG_SLOTS.map(s => {
+    const has = !!(activeTpl.assets || {})[s.kind];
+    const sz  = _acVal(s.kind, 'size', {logo:22, seal:22, signature_seal:44}[s.kind]);
+    const dx  = _acVal(s.kind, 'dx',  0);
+    const dy  = _acVal(s.kind, 'dy',  0);
+    const rot = _acVal(s.kind, 'rot', 0);
+    return `
+      <div class="img-slot">
+        <img src="/api/templates/${activeSlug}/assets/${s.kind}?t=${Date.now()}" alt="${s.kind}"
+             onerror="this.style.opacity=.2">
+        <div class="meta">
+          <div class="kind">${s.label}</div>
+          <div class="sub">${s.note} · ${has ? 'custom upload' : 'shipped default'}</div>
+          <div class="btns">
+            <label class="btn-file">
+              Upload
+              <input type="file" accept="image/png" style="display:none"
+                     onchange="uploadAsset('${s.kind}', this.files[0])">
+            </label>
+            ${has ? `<button class="reset" onclick="resetAsset('${s.kind}')">Reset image</button>` : ''}
+          </div>
+          <div class="placement-grid">
+            <label>size (mm)<input type="number" data-ac="${s.kind}.size"
+                   value="${sz}" min="${s.size.min}" max="${s.size.max}" step="${s.size.step}"></label>
+            <label>rotation (°)<input type="number" data-ac="${s.kind}.rot"
+                   value="${rot}" min="${s.rot.min}" max="${s.rot.max}" step="${s.rot.step}"></label>
+            <label>offset X (mm)<input type="number" data-ac="${s.kind}.dx"
+                   value="${dx}" min="${s.off.min}" max="${s.off.max}" step="${s.off.step}"></label>
+            <label>offset Y (mm)<input type="number" data-ac="${s.kind}.dy"
+                   value="${dy}" min="${s.off.min}" max="${s.off.max}" step="${s.off.step}"></label>
+          </div>
+        </div>
+      </div>`;
   }).join('');
-
-  // "date" is handled by the webpage date picker — hide it from the missing
-  // list and do not render a manual text input for it.
-  const manualMissing = data.missing.filter(function(p) { return p !== 'date'; });
-  if (manualMissing.length > 0) {
-    document.getElementById('manualSection').style.display = '';
-    document.getElementById('manualFields').innerHTML = manualMissing.map(function(p) {
-      return '<div class="field-group"><label>&#123;&#123;' + p + '&#125;&#125;</label>' +
-        '<input type="text" data-field="' + p + '" placeholder="Enter value (shared across all notices)"></div>';
-    }).join('');
-  } else {
-    document.getElementById('manualSection').style.display = 'none';
+  wireDynamicLivePreview();
+}
+function currentAssetsConfig() {
+  const out = {};
+  for (const s of IMG_SLOTS) out[s.kind] = {};
+  for (const inp of document.querySelectorAll('[data-ac]')) {
+    const [kind, key] = inp.dataset.ac.split('.');
+    out[kind][key] = +inp.value;
   }
+  return out;
+}
+async function saveAssetsConfig() {
+  const r = await fetch('/api/templates/' + encodeURIComponent(activeSlug), {
+    method: 'PUT', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({assets_config: currentAssetsConfig()}),
+  });
+  const d = await r.json();
+  if (!r.ok) return flash($('assetsStatus'), d.error || 'failed', 'err');
+  activeTpl = d.template;
+  flash($('assetsStatus'), 'Saved placement.', 'ok');
+  reloadPreview();
+}
+async function resetAssetsConfig() {
+  if (!confirm('Discard placement edits and reload?')) return;
+  await loadActiveTemplate();
+}
+async function uploadAsset(kind, file) {
+  if (!file) return;
+  const fd = new FormData();
+  fd.append('file', file);
+  const r = await fetch('/api/templates/' + encodeURIComponent(activeSlug) + '/assets/' + kind,
+                        {method: 'POST', body: fd});
+  const d = await r.json();
+  if (!r.ok) return flash($('assetsStatus'), d.error || 'upload failed', 'err');
+  await loadActiveTemplate();
+  flash($('assetsStatus'), 'Updated ' + kind + '.', 'ok');
+}
+async function resetAsset(kind) {
+  if (!confirm('Revert ' + kind + ' image to the shipped default?')) return;
+  const r = await fetch('/api/templates/' + encodeURIComponent(activeSlug) + '/assets/' + kind,
+                        {method: 'DELETE'});
+  if (r.ok) { await loadActiveTemplate(); flash($('assetsStatus'), 'Reset.', 'ok'); }
+}
 
-  // Show the date picker whenever the template has a {{date}} placeholder.
-  // Default it to today; the user can change it.
-  const dateSection = document.getElementById('dateSection');
-  const dateInput = document.getElementById('dateValue');
-  if (data.placeholders.indexOf('date') !== -1) {
-    dateSection.style.display = '';
-    if (!dateInput.value) {
+// ── 4. watermark / pattern ───────────────────────
+function currentSecurity() {
+  return {
+    watermark: {
+      enabled: $('wm-enabled').checked,
+      english_template: $('wm-en').value,
+      urdu_template:    $('wm-ur').value,
+      font_size: +$('wm-size').value, opacity: +$('wm-op').value,
+      count:     +$('wm-count').value, color: $('wm-color').value,
+    },
+    pattern: {
+      enabled: $('pt-enabled').checked,
+      opacity: +$('pt-op').value, density: $('pt-density').value,
+    },
+  };
+}
+async function saveSecurity() {
+  const r = await fetch('/api/templates/' + encodeURIComponent(activeSlug), {
+    method: 'PUT', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({security: currentSecurity()}),
+  });
+  const d = await r.json();
+  if (!r.ok) return flash($('secStatus'), d.error || 'failed', 'err');
+  activeTpl = d.template;
+  flash($('secStatus'), 'Saved security overlay.', 'ok');
+  reloadPreview();
+}
+async function resetSecurity() {
+  if (!confirm('Discard security edits and reload?')) return;
+  await loadActiveTemplate();
+}
+
+// ── 5. Excel upload + generate ───────────────────
+$('xlsFile').addEventListener('change', function() {
+  $('analyzeBtn').disabled = !this.files.length;
+});
+async function doUpload() {
+  const btn = $('analyzeBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Analyzing…';
+  const fd = new FormData();
+  fd.append('excel', $('xlsFile').files[0]);
+  fd.append('template_slug', activeSlug);
+  try {
+    const r = await fetch('/upload', {method: 'POST', body: fd});
+    const d = await r.json();
+    if (d.error) { alert(d.error); return; }
+    excelAnalysis = d;
+    renderAnalysis(d);
+  } catch (e) { alert('Upload failed: ' + e.message); }
+  finally {
+    btn.disabled = false;
+    btn.textContent = 'Analyze Excel';
+  }
+}
+function renderAnalysis(d) {
+  $('analysisArea').style.display = '';
+  const info = $('matchInfo');
+  if (d.missing.length === 0) {
+    info.innerHTML = `<div class="info info-ok">All ${d.placeholders.length} placeholders matched. ${d.row_count} rows.</div>`;
+  } else {
+    info.innerHTML = `<div class="info info-warn">${d.matched.length}/${d.placeholders.length} matched · ${d.missing.length} need manual input · ${d.row_count} rows.</div>`;
+  }
+  $('placeholderTags').innerHTML = d.placeholders.map(p => {
+    const ok = d.matched.indexOf(p) !== -1;
+    return `<span class="tag ${ok ? 'tag-ok' : 'tag-miss'}">&#123;&#123;${p}&#125;&#125;</span>`;
+  }).join('');
+  const manualMissing = d.missing.filter(p => p !== 'date');
+  const ms = $('manualSection');
+  if (manualMissing.length) {
+    ms.style.display = '';
+    $('manualFields').innerHTML = manualMissing.map(p =>
+      `<div class="field"><label>&#123;&#123;${p}&#125;&#125;</label><input type="text" data-field="${p}" placeholder="Value shared across rows"></div>`
+    ).join('');
+  } else ms.style.display = 'none';
+  const dateSec = $('dateSection');
+  if (d.placeholders.includes('date')) {
+    dateSec.style.display = '';
+    if (!$('dateValue').value) {
       const t = new Date();
-      const y = t.getFullYear();
-      const m = String(t.getMonth() + 1).padStart(2, '0');
-      const d = String(t.getDate()).padStart(2, '0');
-      dateInput.value = y + '-' + m + '-' + d;
+      $('dateValue').value = t.getFullYear() + '-' +
+        String(t.getMonth()+1).padStart(2,'0') + '-' +
+        String(t.getDate()).padStart(2,'0');
     }
-  } else {
-    dateSection.style.display = 'none';
-    dateInput.value = '';
-  }
-
-  if (data.preview.length > 0) {
-    const headers = data.excel_headers;
+  } else { dateSec.style.display = 'none'; }
+  if (d.preview.length) {
+    $('previewSection').style.display = '';
     let html = '<table class="preview"><thead><tr><th>#</th>';
-    headers.forEach(function(h) { html += '<th>' + h + '</th>'; });
+    d.excel_headers.forEach(h => html += `<th>${h}</th>`);
     html += '</tr></thead><tbody>';
-    data.preview.forEach(function(row, i) {
-      html += '<tr><td>' + (i + 1) + '</td>';
-      headers.forEach(function(h) { html += '<td>' + (row[h] !== undefined && row[h] !== null ? row[h] : '') + '</td>'; });
+    d.preview.forEach((row, i) => {
+      html += `<tr><td>${i+1}</td>`;
+      d.excel_headers.forEach(h => html += `<td>${row[h] ?? ''}</td>`);
       html += '</tr>';
     });
     html += '</tbody></table>';
-    document.getElementById('previewTable').innerHTML = html;
+    $('previewTable').innerHTML = html;
   }
-
-  // Populate filename checkbox grid — nothing is pre-selected, user picks
-  // the columns themselves in the webpage.
-  const fnBox = document.getElementById('filenameFields');
-  fnBox.innerHTML = data.excel_headers.map(function(h) {
-    return '<label><input type="checkbox" value="' + h + '">' + h + '</label>';
-  }).join('');
-
-  // Populate group-by dropdown — no pre-selection.
-  const gb = document.getElementById('groupByField');
-  gb.innerHTML = '<option value="">No grouping (single output.zip)</option>';
-  data.excel_headers.forEach(function(h) {
-    gb.innerHTML += '<option value="' + h + '">' + h + '</option>';
-  });
+  $('filenameFields').innerHTML = d.excel_headers.map(h =>
+    `<label><input type="checkbox" value="${h}">${h}</label>`).join('');
+  $('groupByField').innerHTML = '<option value="">No grouping</option>' +
+    d.excel_headers.map(h => `<option value="${h}">${h}</option>`).join('');
 }
 
 async function doGenerate() {
-  const btn = document.getElementById('genBtn');
-  const status = document.getElementById('genStatus');
-  const progressSection = document.getElementById('progressSection');
-  const progressFill = document.getElementById('progressFill');
-  const progressText = document.getElementById('progressText');
-
+  const btn = $('genBtn');
   btn.disabled = true;
-  const fmt = document.getElementById('outputFormat').value;
-  btn.innerHTML = '<span class="spinner"></span>Processing...';
+  btn.innerHTML = '<span class="spinner"></span>Processing…';
+  $('progressSection').style.display = '';
+  $('progressFill').style.width = '0%';
+  $('progressText').textContent = 'Starting…';
+  const gs = $('genStatus');
+  gs.textContent = ''; gs.className = 'status-msg';
 
   const manualFields = {};
-  document.querySelectorAll('#manualFields input[data-field]').forEach(function(input) {
-    manualFields[input.dataset.field] = input.value;
-  });
+  document.querySelectorAll('#manualFields input[data-field]').forEach(i =>
+    manualFields[i.dataset.field] = i.value);
+  const filenameFields = Array.from(document.querySelectorAll('#filenameFields input:checked'))
+    .map(cb => cb.value);
 
-  const filenameFields = Array.prototype.slice.call(
-    document.querySelectorAll('#filenameFields input[type="checkbox"]:checked')
-  ).map(function(cb) { return cb.value; });
-  const groupByField = document.getElementById('groupByField').value;
-
-  progressSection.style.display = '';
-  progressFill.style.width = '0%';
-  progressText.textContent = 'Starting...';
-  status.innerHTML = '';
-  status.style.color = '#64748b';
-
-  // Track which ready_parts we've already triggered downloads for, so
-  // we don't re-download them on each subsequent poll.
+  const downloaded = [];
   const triggered = new Set();
-  const downloadedNames = [];
-
-  function triggerDownload(tid, part) {
+  function trigger(tid, part) {
     const a = document.createElement('a');
     a.href = '/download/' + tid + '/' + part.index;
     a.download = part.name;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    downloadedNames.push(part.name);
-    renderDownloadedList();
+    document.body.appendChild(a); a.click(); a.remove();
+    downloaded.push(part.name);
+    gs.innerHTML = 'Downloaded (' + downloaded.length + '): <b>' + downloaded.join('</b>, <b>') + '</b>';
+    gs.className = 'status-msg ok';
   }
 
-  function renderDownloadedList() {
-    if (downloadedNames.length === 0) { status.innerHTML = ''; return; }
-    status.innerHTML = 'Downloaded (' + downloadedNames.length + '): <b>' +
-      downloadedNames.join('</b>, <b>') + '</b>';
-    status.style.color = 'var(--success)';
-  }
-
-  let taskId = null;
+  let tid;
   try {
-    const resp = await fetch('/generate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+    const r = await fetch('/generate', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
-        manual_fields: manualFields,
-        filename_fields: filenameFields,
-        group_by_field: groupByField,
-        output_format: fmt,
-        date_value: document.getElementById('dateValue').value,
-        machine: document.getElementById('machineProfile').value,
+        manual_fields: manualFields, filename_fields: filenameFields,
+        group_by_field: $('groupByField').value,
+        date_value: $('dateValue').value,
+        machine: $('machineProfile').value,
       })
     });
-    const data = await resp.json();
-    if (data.error) { alert(data.error); return; }
-    taskId = data.task_id;
+    const d = await r.json();
+    if (d.error) { alert(d.error); return; }
+    tid = d.task_id;
 
-    // Poll status until done. On each poll:
-    //   1. update overall + per-group progress
-    //   2. trigger a download for any newly-ready group part
     while (true) {
-      await new Promise(function(r) { setTimeout(r, 800); });
-      const sr = await fetch('/status/' + taskId);
-      const s = await sr.json();
+      await new Promise(r => setTimeout(r, 900));
+      const s = await (await fetch('/status/' + tid)).json();
       if (s.error) throw new Error(s.error);
-
-      const pct = s.total > 0 ? Math.round((s.progress / s.total) * 100) : 0;
-      progressFill.style.width = pct + '%';
-
-      // Build a detailed progress line so the user sees both the overall
-      // picture and what's happening in the current group right now.
-      let line = s.stage + ' — overall ' + s.progress + '/' + s.total + ' (' + pct + '%)';
+      const pct = s.total > 0 ? Math.round(s.progress / s.total * 100) : 0;
+      $('progressFill').style.width = pct + '%';
+      let line = `${s.stage} — ${s.progress}/${s.total} (${pct}%)`;
       if (s.groups_total) {
-        const gIdx = s.status === 'done' ? s.groups_total
-                    : Math.min(s.groups_done + 1, s.groups_total);
-        line += ' · group ' + gIdx + '/' + s.groups_total;
+        const gi = s.status === 'done' ? s.groups_total : Math.min(s.groups_done + 1, s.groups_total);
+        line += ` · group ${gi}/${s.groups_total}`;
         if (s.current_group && s.status !== 'done') {
-          line += ' [' + s.current_group;
-          if (s.group_total) {
-            line += ' ' + s.group_progress + '/' + s.group_total;
-          }
-          line += ']';
+          line += ' [' + s.current_group + (s.group_total ? ' ' + s.group_progress + '/' + s.group_total : '') + ']';
         }
       }
-      progressText.textContent = line;
-
-      // Trigger downloads for any newly-ready parts.
-      (s.ready_parts || []).forEach(function(part) {
-        if (!triggered.has(part.index)) {
-          triggered.add(part.index);
-          triggerDownload(taskId, part);
-        }
+      $('progressText').textContent = line;
+      (s.ready_parts || []).forEach(p => {
+        if (!triggered.has(p.index)) { triggered.add(p.index); trigger(tid, p); }
       });
-
       if (s.status === 'done') break;
       if (s.status === 'error') throw new Error(s.error || 'Generation failed');
     }
-
-    progressText.textContent = 'All ' + downloadedNames.length + ' group(s) processed and downloaded.';
+    $('progressText').textContent = 'Done. ' + downloaded.length + ' group(s) downloaded.';
   } catch (e) {
-    status.textContent = 'Generation failed: ' + e.message;
-    status.style.color = 'var(--danger)';
+    gs.textContent = 'Failed: ' + e.message; gs.className = 'status-msg err';
     alert('Generation failed: ' + e.message);
   } finally {
     btn.disabled = false;
     btn.textContent = 'Generate Notices';
   }
 }
+
+// ── 6. generate-mode toggle + manual single-notice ─
+function setGenMode(mode) {
+  $('excelPanel').style.display  = mode === 'excel'  ? '' : 'none';
+  $('manualPanel').style.display = mode === 'manual' ? '' : 'none';
+  if (mode === 'manual') loadManualFields();
+  // Refresh preview — switching modes changes whether typed fields
+  // feed into the partial-fill preview.
+  reloadPreview();
+}
+document.querySelectorAll('input[name="gen-mode"]').forEach(r => {
+  r.addEventListener('change', e => setGenMode(e.target.value));
+});
+// Event delegation: any typing / date change inside the manual grid
+// triggers the (debounced) preview refresh. Added once here — the
+// script runs at end-of-body so the grid element already exists, and
+// only its children get regenerated on template switches.
+(function wireManualGrid() {
+  const grid = $('manualFieldGrid');
+  if (!grid) return;
+  grid.addEventListener('input', reloadPreview);
+  grid.addEventListener('change', reloadPreview);
+})();
+async function loadManualFields() {
+  const r = await fetch('/api/templates/' + encodeURIComponent(activeSlug) + '/placeholders');
+  if (!r.ok) { flash($('genOneStatus'), 'failed to load placeholders', 'err'); return; }
+  const d = await r.json();
+  const grid = $('manualFieldGrid');
+  const today = new Date().toISOString().slice(0, 10);
+  // Preserve any values the user already typed so switching templates or
+  // reloading fields doesn't wipe half-filled forms.
+  const prev = {};
+  for (const inp of document.querySelectorAll('[data-manual]')) {
+    prev[inp.dataset.manual] = inp.value;
+  }
+  // Any placeholder whose name contains "date" (case-insensitive) gets
+  // a date picker — catches `date`, `Due_date`, `disb_date`, etc.
+  const isDate  = p => /date/i.test(p);
+  // Money placeholders come from the backend (matches MONEY_KEYWORDS).
+  const money   = new Set(d.money || []);
+  // Payable is derived from Principal + Interest + Penalty — make
+  // the input read-only so the user can't fight the total.
+  grid.innerHTML = d.placeholders.map(p => {
+    const cls = (p === 'notice-body-text' || p.length > 18) ? 'field full' : 'field';
+    if (isDate(p)) {
+      return `<div class="${cls}"><label>&#123;&#123;${p}&#125;&#125;</label>`
+           + `<input type="date" data-manual="${p}" value="${prev[p] || today}"></div>`;
+    }
+    const v = prev[p] || '';
+    if (p === 'Payable') {
+      return `<div class="${cls}"><label>&#123;&#123;${p}&#125;&#125;`
+           + ` <span class="auto-tag">auto · Principal + Interest + Penalty</span></label>`
+           + `<input type="text" data-manual="${p}" data-derived="1" readonly`
+           + ` value="${v.replace(/"/g,'&quot;')}" placeholder="0.00"></div>`;
+    }
+    const moneyAttrs = money.has(p)
+      ? ' data-money="1" inputmode="decimal" onblur="fmtMoneyInput(this)"' : '';
+    return `<div class="${cls}"><label>&#123;&#123;${p}&#125;&#125;</label>`
+         + `<input type="text" data-manual="${p}"${moneyAttrs}`
+         + ` value="${v.replace(/"/g,'&quot;')}"`
+         + ` placeholder="value for ${p}"></div>`;
+  }).join('');
+  recalcPayable();
+}
+function _parseMoney(s) {
+  if (!s) return 0;
+  const num = parseFloat(s.replace(/[^\d.-]/g, ''));
+  return isNaN(num) ? 0 : num;
+}
+function _fmtMoney(num) {
+  return num.toLocaleString('en-US',
+    {minimumFractionDigits: 2, maximumFractionDigits: 2});
+}
+function recalcPayable() {
+  const principal = _parseMoney(($('manualFieldGrid').querySelector('[data-manual="Principal_Amount"]') || {}).value);
+  const interest  = _parseMoney(($('manualFieldGrid').querySelector('[data-manual="Interest"]')         || {}).value);
+  const penalty   = _parseMoney(($('manualFieldGrid').querySelector('[data-manual="Penalty"]')          || {}).value);
+  const payable   = $('manualFieldGrid').querySelector('[data-manual="Payable"]');
+  if (payable) payable.value = _fmtMoney(principal + interest + penalty);
+}
+function fmtMoneyInput(inp) {
+  if (inp.value.trim()) {
+    const num = parseFloat(inp.value.replace(/[^\d.-]/g, ''));
+    if (!isNaN(num)) inp.value = _fmtMoney(num);
+  }
+  recalcPayable();
+  reloadPreview();
+}
+function collectManualFields() {
+  const out = {};
+  for (const inp of document.querySelectorAll('[data-manual]')) {
+    const key = inp.dataset.manual;
+    let v = inp.value;
+    if (inp.type === 'date' && v) {
+      const [y, m, d] = v.split('-');
+      v = `${d}/${m}/${y}`;
+    }
+    if (v && v.trim() !== '') out[key] = v;
+  }
+  return out;
+}
+async function doGenerateOne() {
+  const fields = {};
+  for (const inp of document.querySelectorAll('[data-manual]')) {
+    const key = inp.dataset.manual;
+    let v = inp.value;
+    if (inp.type === 'date' && v) {
+      // <input type="date"> always yields ISO (YYYY-MM-DD); the notice
+      // template wants DD/MM/YYYY. Convert client-side so every date
+      // field (date, Due_date, disb_date, ...) gets the right format.
+      const [y, m, d] = v.split('-');
+      v = `${d}/${m}/${y}`;
+    }
+    if (v && v.trim() !== '') fields[key] = v;
+  }
+  const btn = $('genOneBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Rendering…';
+  flash($('genOneStatus'), '', '');
+  try {
+    const r = await fetch('/generate_one', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        template_slug: activeSlug,
+        fields,
+      }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({error: 'server error'}));
+      throw new Error(err.error || 'failed');
+    }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    // Keep Unicode letters (Chinese etc.) in the download filename;
+    // only strip filesystem-unsafe punctuation. \w is ASCII-only in JS.
+    const raw = (fields.name || 'notice').replace(/[\\\/:*?"<>|\r\n\t]+/g, '_').slice(0, 60);
+    a.href = url; a.download = (raw || 'notice') + '.pdf';
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    flash($('genOneStatus'), 'Downloaded ' + a.download + '.', 'ok');
+  } catch (e) {
+    flash($('genOneStatus'), 'Failed: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Generate single PDF';
+  }
+}
+
+// ── boot ─────────────────────────────────────────
+(async () => {
+  await loadTemplateList();
+  await loadActiveTemplate();
+  wireStaticLivePreview();
+})();
 </script>
 </body>
 </html>
 """
+
 
 LOGIN_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -1422,6 +3558,8 @@ HTML_TEMPLATE = HTML_TEMPLATE.replace("__LOGO_DATA_URI__", LOGO_DATA_URI)
 LOGIN_TEMPLATE = LOGIN_TEMPLATE.replace("__LOGO_DATA_URI__", LOGO_DATA_URI)
 
 
+
+
 if __name__ == "__main__":
     print("=" * 50)
     print("  Legal Notice Generator")
@@ -1430,8 +3568,7 @@ if __name__ == "__main__":
     for _name, _prof in MACHINE_PROFILES.items():
         _marker = " (default)" if _name == DEFAULT_MACHINE else ""
         print(f"    - {_name:4s}{_marker}  render={_prof['render_workers']}  "
-              f"convert={_prof['convert_workers']}  "
-              f"chunk={_prof['pdf_chunk_size']}  [{_prof['label']}]")
+              f"[{_prof['label']}]")
     print("  Open browser: http://127.0.0.1:5002")
     print("=" * 50)
     # threaded=True is required so the /status and /download polling hits
