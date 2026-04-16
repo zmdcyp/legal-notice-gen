@@ -9,6 +9,15 @@ APP_DIR="/opt/$APP_NAME"
 APP_USER="legalnotice"
 DOMAIN=""  # 如有域名，填入后会配置 HTTPS
 
+# 访问密码：留空就用源码里 _DEFAULT_PASSWORD（不推荐生产用）
+# 非交互式部署时先 `export LEGAL_NOTICE_PASSWORD=...` 再跑本脚本。
+APP_PASS="${LEGAL_NOTICE_PASSWORD:-}"
+if [ -z "$APP_PASS" ] && [ -t 0 ]; then
+    echo -n "Set LEGAL_NOTICE_PASSWORD (回车跳过,用源码默认密码): "
+    read -rs APP_PASS
+    echo
+fi
+
 echo "================================================"
 echo "  律师函批量生成工具 - VPS 部署"
 echo "================================================"
@@ -35,6 +44,9 @@ echo "[3/6] 部署应用代码..."
 mkdir -p "$APP_DIR"
 cp legal_notice_gen.py "$APP_DIR/"
 cp requirements.txt "$APP_DIR/"
+# templates/ 包含 base HTML + 字体 + 出厂 PNG —— 运行时必须存在。
+# 递归复制以保留 static/fonts/*.ttf 和 static/images/*.png。
+cp -r templates "$APP_DIR/"
 
 cd "$APP_DIR"
 python3 -m venv venv
@@ -54,24 +66,32 @@ chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 # 否则 /status 和 /download 轮询会落到其他 worker 拿不到任务状态。
 # --timeout 1800 让单个后台任务最多跑 30 分钟。
 echo "[4/6] 配置 systemd 服务..."
-cat > /etc/systemd/system/$APP_NAME.service << 'EOF'
+PASS_ENV=""
+if [ -n "$APP_PASS" ]; then
+    # systemd Environment 行需要转义双引号
+    ESC_PASS=$(printf '%s' "$APP_PASS" | sed 's/"/\\"/g')
+    PASS_ENV="Environment=\"LEGAL_NOTICE_PASSWORD=${ESC_PASS}\""
+fi
+
+cat > /etc/systemd/system/$APP_NAME.service << EOF
 [Unit]
 Description=律师函批量生成工具
 After=network.target
 
 [Service]
 Type=simple
-User=legalnotice
-Group=legalnotice
-WorkingDirectory=/opt/legal_notice_gen
-Environment="PATH=/opt/legal_notice_gen/venv/bin:/usr/bin"
-ExecStart=/opt/legal_notice_gen/venv/bin/gunicorn \
-    --bind 127.0.0.1:5002 \
-    --workers 1 \
-    --threads 16 \
-    --worker-class gthread \
-    --timeout 1800 \
-    --graceful-timeout 60 \
+User=$APP_USER
+Group=$APP_USER
+WorkingDirectory=$APP_DIR
+Environment="PATH=$APP_DIR/venv/bin:/usr/bin"
+$PASS_ENV
+ExecStart=$APP_DIR/venv/bin/gunicorn \\
+    --bind 127.0.0.1:5002 \\
+    --workers 1 \\
+    --threads 16 \\
+    --worker-class gthread \\
+    --timeout 1800 \\
+    --graceful-timeout 60 \\
     legal_notice_gen:app
 Restart=always
 RestartSec=5
@@ -116,9 +136,17 @@ echo ""
 echo "================================================"
 echo "  服务已启动!"
 echo "  访问: http://$(hostname -I | awk '{print $1}')"
+if [ -z "$APP_PASS" ]; then
+    echo ""
+    echo "  ⚠ 使用源码里的默认密码（仓库公开，风险!）"
+    echo "    改密码: edit /etc/systemd/system/$APP_NAME.service"
+    echo "            加一行 Environment=\"LEGAL_NOTICE_PASSWORD=<your-pass>\""
+    echo "            然后 systemctl daemon-reload && systemctl restart $APP_NAME"
+fi
 echo ""
 echo "  常用命令:"
 echo "    查看状态:  systemctl status $APP_NAME"
 echo "    查看日志:  journalctl -u $APP_NAME -f"
 echo "    重启服务:  systemctl restart $APP_NAME"
+echo "    更新代码:  cd <本地项目> && scp -r . root@VPS:$APP_DIR/ && systemctl restart $APP_NAME"
 echo "================================================"
