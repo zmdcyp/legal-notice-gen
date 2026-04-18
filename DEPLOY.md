@@ -4,6 +4,8 @@
 
 仓库里有一键脚本 `deploy/setup.sh`，大多数情况直接 `sudo bash` 它就行。这篇文档解释每一步在做什么、出问题怎么查。
 
+> **架构概览** 放在 [`ARCHITECTURE.md`](ARCHITECTURE.md)（组件图、数据流、安全模型、规模分析、VPS 资源配比）。本文是操作手册。
+
 ---
 
 ## 前置要求
@@ -118,16 +120,28 @@ journalctl -u legal_notice_gen -f    # 实时日志
 
 ### 访问密码
 
-**部署时没填** → 用源码里 `legal_notice_gen.py:94` 的 `RT%L6IXoXT*^r=z6%npe`。**仓库公开**，公网部署一定要改。
+**部署时没填** → 用源码里 `_DEFAULT_PASSWORD` 的 32 位随机值。**仓库公开**，公网部署一定要改。
 
-**改密码**：
+**改密码**（并一次性设好所有新的环境变量）：
 ```bash
-sudo vim /etc/systemd/system/legal_notice_gen.service
-# 在 [Service] 块里加一行：
-#   Environment="LEGAL_NOTICE_PASSWORD=你的新密码"
-# 已经有就直接改值
+sudo systemctl edit legal_notice_gen   # 写 override，避免动原 unit 文件
+```
+在编辑器里填（按你的实际值）：
+```ini
+[Service]
+Environment="LEGAL_NOTICE_PASSWORD=<你的强密码>"
+Environment="VERIFY_BASE_URL=https://v.sspak.law/public/verify"
+Environment="PUBLIC_VERIFY_ENABLED=1"
+Environment="TURNSTILE_SITE_KEY=0x4AAAA...site-key"
+Environment="TURNSTILE_SECRET_KEY=0x4AAAA...secret-key"
+```
+```bash
 sudo systemctl daemon-reload
 sudo systemctl restart legal_notice_gen
+journalctl -u legal_notice_gen -n 20 --no-pager
+# 启动日志里应看到:
+#   Public verify: ENABLED at /public/verify (Cloudflare Turnstile)
+#   rate limit: 5/min, 100/day per IP
 ```
 
 登录用的是 `hmac.compare_digest` 常量时间比较，没有时序泄漏。但也**没有 rate limit**——公网上要防暴力猜密码，在 Nginx 加一条：
@@ -140,6 +154,27 @@ location = /login {
 # http {} 块里定义 zone：
 #   limit_req_zone $binary_remote_addr zone=login:10m rate=10r/m;
 ```
+
+### 公开验真 `/public/verify`
+
+2026-04-18 起开放的免登录序列号验证入口。两层防护：
+- **CAPTCHA**：Turnstile（首选）或 server-side 数学题（fallback）
+- **限流**：按真实客户端 IP 5/分 · 100/天
+
+**启用 Turnstile**（强烈推荐生产用，数学题 fallback 扛不住机器人）：
+1. [dash.cloudflare.com](https://dash.cloudflare.com) → Turnstile → Add site →
+   Hostnames 填你的验真域名（如 `v.sspak.law`）
+2. 拿到 site key 和 secret key 填进 systemd override（见上）
+3. 重启服务看日志确认 `Public verify: ENABLED ... (Cloudflare Turnstile)`
+
+**限流依赖真实 IP**——Nginx 必须正确转发 `X-Forwarded-For`，否则代码里 `_client_ip()` 会退化到 `127.0.0.1`、整个限流失效。一键脚本生成的 Nginx 配置已经带了：
+```nginx
+proxy_set_header X-Real-IP         $remote_addr;
+proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+```
+如果在 Cloudflare 后面，CF 会设 `CF-Connecting-IP`；VPS Nginx 要么用它要么信任 CF 的 `X-Forwarded-For`（默认 `$proxy_add_x_forwarded_for` 会追加在 CF 原始值后，代码取第一个，正确）。
+
+**QR 深链域名** —— `VERIFY_BASE_URL` 决定生成的 PDF QR 编码的 URL 和 PDF 上印的 "Scan to verify at ..." 文本。换域名时改这个 env var 就够了，代码里没有硬编码。
 
 ### HTTPS（公网必配）
 

@@ -153,7 +153,8 @@ sudo bash deploy/setup.sh
 
 > ⚠️ **Gunicorn 必须 `--workers 1`**：任务状态 (`TASKS` dict) 驻留单进程内存，`/status` 轮询和 `/download` 必须命中同一进程。并发靠 `--threads` 而不是 `--workers`。
 
-**完整 VPS 部署指南（配置调优、HTTPS、常见问题、卸载步骤）见 [`DEPLOY.md`](DEPLOY.md)。**
+- **架构图 + 数据流 + 安全模型 + VPS 配比** 见 [`ARCHITECTURE.md`](ARCHITECTURE.md)（`架构与 VPS 部署方案`）
+- **操作手册（配置调优、HTTPS、Turnstile、常见问题、卸载）** 见 [`DEPLOY.md`](DEPLOY.md)
 
 ## 单页工作台使用
 
