@@ -338,13 +338,16 @@ uploads/
 
 ### 模板 CRUD
 
+> **2026-04-18 锁定**：`TEMPLATES_LOCKED = True` 限制只保留内置 `default` 模板，**不能新建/删除/改名**，但 body / 水印 / 图片的内容编辑 (PUT body/security/assets_config、asset POST/DELETE) 仍然放行。启动时
+> `_cleanup_non_builtin_template_dirs()` 会自动清掉 `uploads/templates/` 下非 `default/` 的残留目录；`default/` overlay 保留，重启不丢编辑。`TEMPLATES_LOCKED = False` 一键恢复完整 CRUD。
+
 | 方法 | 路径 | 用途 |
 |---|---|---|
 | `GET` | `/api/templates` | 列表 `[{slug, name, builtin, created, updated}, ...]` |
 | `GET` | `/api/templates/<slug>` | 读 `{slug, name, builtin, blocks, security, assets:{logo:bool, seal:bool, signature_seal:bool}, assets_config}` |
-| `PUT` | `/api/templates/<slug>` | 改（body: `{name?, blocks?, security?, assets_config?}`），未传字段保持不变 |
-| `POST` | `/api/templates` | 新建（body: `{name, base_slug?, blocks?, security?, assets_config?}`；继承 base 的图片 + 放置数值） |
-| `DELETE` | `/api/templates/<slug>` | 删除（`default` 拒绝） |
+| `PUT` | `/api/templates/<slug>` | 改内容（body: `{name?, blocks?, security?, assets_config?}`）——锁定时 `name` 字段被静默丢弃，其他字段照常生效 |
+| `POST` | `/api/templates` | 新建——**锁定时返 403** |
+| `DELETE` | `/api/templates/<slug>` | 删除——`default` 始终拒绝，锁定时对任何 slug 返 403 |
 | `POST` | `/api/templates/<slug>/assets/<kind>` | 上传 PNG（form-data `file`；kind ∈ `logo, seal, signature_seal`） |
 | `DELETE` | `/api/templates/<slug>/assets/<kind>` | 退回出厂默认图 |
 | `GET` | `/api/templates/<slug>/assets/<kind>` | 取图（有覆盖返覆盖，否则出厂默认） |
@@ -383,17 +386,37 @@ uploads/
 `YYYY-MM-DD_batch-NNN.zip`，外层是 `ZIP_STORED`、内层每个 `<负责人>.zip`。
 `/download` 对 `persistent=True` 的 part 跳过 10 分钟清理计时器。
 
-### 历史 / 反查（2026-04-16 新增）
+### 历史 / 反查（2026-04-16 起）
+
+**内部（auth）**
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| `GET` | `/verify` | UI 页面：输入 16 位序列号反查真伪 + 查看最近历史表 |
+| `GET` | `/verify` | UI 页面：序列号反查 + 最近历史表 + 查询审计日志 |
 | `GET` | `/api/verify?serial=...` | 返回 `{ok, name, principal, generated_at}` 或 404 |
-| `GET` | `/api/history?limit=&offset=&q=` | 分页列表，`q` 按姓名模糊搜 |
+| `GET` | `/api/history?limit=&offset=&q=` | 生成历史分页，`q` 按姓名模糊搜 |
+| `GET` | `/api/verify_log?limit=&offset=&source=&hit=&q=` | **2026-04-18 新增**：查询审计日志；`source=public\|internal`、`hit=0\|1`、`q` 模糊搜 serial / ip |
 
-数据存 `uploads/history.db`（SQLite + WAL）。容量上限 2,000,000 条，超出自动 FIFO 删最旧。每次 Excel / Manual 生成成功都写一行（失败行不记录）。
+**公开（无登录，2026-04-18 新增）**
 
-**完整的查询 API 规范（请求参数、响应字段、错误码、序列号格式、未来扩展预留、数据模型）见 [`INQUIRY_API.md`](INQUIRY_API.md)**——独立文档以便未来接入第三方系统（OA、移动 App、合作方核验服务）。
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| `GET` | `/public/verify` | 公开验真 HTML 页，手机优化 |
+| `GET` | `/api/public/verify/challenge` | math 模式领 CAPTCHA token |
+| `POST` | `/api/public/verify` | `{serial, turnstile_token\|captcha_token+answer}` → `{ok, name, principal, generated_at}` 或 `{ok:false}` |
+
+公开端点默认开启，两层防护：
+- **CAPTCHA**：`TURNSTILE_SITE_KEY` + `TURNSTILE_SECRET_KEY` 都配 → Cloudflare Turnstile；否则 fallback 到服务端数学题（单次 token、5 分钟 TTL）
+- **限流**：按客户端 IP（`X-Forwarded-For` 第一跳），5/分 · 100/天，超限 429
+- 格式错序列号早于 CAPTCHA/限流就 400；查不到返 `{ok: false}`（不是 404），降低枚举探测价值
+
+**数据存储**：
+- `uploads/history.db` · 表 `notice_history`：生成历史，2 M 条上限 FIFO
+- `uploads/history.db` · 表 `verify_log`：查询审计，500 k 条上限 FIFO，字段 `(id, ts, source, ip, serial, hit, ua)`；公开/内部两条查询路径都写一条
+
+**QR 深链**（2026-04-18）：每条律师函的 QR 编码 `VERIFY_BASE_URL?serial=XXXX-XXXX-XXXX-XXXX`（默认 `https://v.sspak.law/public/verify`），手机扫码直接开页面、serial 预填，用户只需解 CAPTCHA。PDF 的 QR 下方也印一行 `Scan to verify at v.sspak.law` 方便不扫的人手打。
+
+**完整查询 API 规范见 [`INQUIRY_API.md`](INQUIRY_API.md)**——独立文档以便未来接入第三方系统（OA、移动 App、合作方核验服务）。
 
 ### 认证
 

@@ -284,6 +284,28 @@
     color: #333;
     white-space: nowrap;
   }
+  /* Between QR and serial: plain-text invitation to scan-or-type.
+     Prints as pixels (whole PDF is rasterized), so the underline is
+     decorative rather than clickable — still reads as "tap-to-open"
+     to anyone pointing a phone at the page. */
+  .qr-footer-br .qr-verify-line {
+    font-family: "Libre Baskerville", Georgia, serif;
+    font-size: 7pt;
+    line-height: 1.25;
+    color: #333;
+    text-align: center;
+    letter-spacing: 0.1pt;
+    margin-top: -0.5mm;
+    white-space: nowrap;
+  }
+  .qr-footer-br .qr-verify-line a,
+  .qr-footer-br .qr-verify-line .url {
+    text-decoration: underline;
+    text-decoration-thickness: 0.5pt;
+    text-underline-offset: 1pt;
+    color: #111;
+    font-weight: 600;
+  }
 
   /* Left column: firm seal anchored to the LEFT edge of its grid cell
      then nudged +8mm to the right so it sits symmetrically opposite
@@ -460,7 +482,7 @@
   <!-- Page footer — repeated on every page -->
   <div class="contact" data-purpose="page-footer">
     <p><span class="lbl">Office:</span> Plot# 81, I&amp;T Center, G-9/4 Islamabad.
-       &nbsp;|&nbsp; <span class="lbl">Email:</span> sandslawfirm3187@gmail.com</p>
+       &nbsp;|&nbsp; <span class="lbl">Email:</span> J@sspak.law</p>
     <p><span class="lbl">Phone:</span> +92 303 9175939 &nbsp;|&nbsp; +92 333 5649275</p>
   </div>
 
@@ -524,10 +546,19 @@
     </div>
   </div>
 
-  <!-- ── QR + anti-counterfeit serial: absolute bottom-right ── -->
+  <!-- ── QR + "Scan to verify at …" + anti-counterfeit serial,
+       absolute bottom-right. The QR payload is the full verify URL
+       with the serial baked into the query string, so scanning on a
+       phone opens the public verify page with the input pre-filled.
+       The printed hostname line lets someone type it manually when
+       they can't scan. -->
   <div class="qr-footer-br">
     <div class="qr-slot" data-slot="qr">
       <div class="placeholder">QR</div>
+    </div>
+    <div class="qr-verify-line">
+      Scan to verify at
+      <a href="__VERIFY_HOME_URL__" class="url">__VERIFY_HOST__</a>
     </div>
     <div class="qr-sn">__QR_SN__</div>
   </div>
@@ -535,7 +566,7 @@
   <!-- ── CONTACT FOOTER ── -->
   <div class="contact" data-purpose="page-footer">
     <p><span class="lbl">Office:</span> Plot# 81, I&amp;T Center, G-9/4 Islamabad.
-       &nbsp;|&nbsp; <span class="lbl">Email:</span> sandslawfirm3187@gmail.com</p>
+       &nbsp;|&nbsp; <span class="lbl">Email:</span> J@sspak.law</p>
     <p><span class="lbl">Phone:</span> +92 303 9175939 &nbsp;|&nbsp; +92 333 5649275</p>
   </div>
 

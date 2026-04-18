@@ -2,6 +2,120 @@
 
 本文件记录项目的重要变更。格式：按日期倒序，最新的变更在最上面。
 
+## 2026-04-18 (公开验真 + QR 深链 + 模板锁定)
+
+一批围绕"律师函送达后的真伪验证"的补强：把验真能力开放给收函人（扫码即可，
+不需要登录），同时在后端留下每次查询的完整审计；PDF 里加一行"Scan to
+verify at …"，QR 直接编码带 serial 的深链；工作台模板对象锁死但内容仍可编辑。
+
+### 新增
+
+- **`/public/verify` 公开验真页（免登录 + CAPTCHA + 限流）**
+  - 没有 session cookie 也能打开；CAPTCHA 首选 Cloudflare Turnstile
+    （设 `TURNSTILE_SITE_KEY` + `TURNSTILE_SECRET_KEY` 两个环境变量开启），
+    没配就 fallback 到 server-side 数学题（单次 token、5 分钟 TTL、
+    单次消费——就算答错也作废）
+  - 按客户端 IP（读 `X-Forwarded-For` 第一跳）限流：默认 **5/分 · 100/天**
+    滑动窗口，超限 429；阈值在代码里 `PUBLIC_VERIFY_RL_PER_MIN` /
+    `_PER_DAY` 调
+  - 整个 endpoint 默认开启，`PUBLIC_VERIFY_ENABLED=0` 关闭
+  - 手机优化：`@media (max-width: 640px)` 收窄 padding、CAPTCHA
+    行 flex-wrap、result label 行内显示、Verify 按钮保 44px+ 触摸区
+  - 三个新路由（全部免登录）：`GET /public/verify` · `GET /api/public/verify/challenge`
+    （math 模式发 token） · `POST /api/public/verify`（查 serial）
+  - 格式不合法的 serial 在进 CAPTCHA / 限流之前就 400，免得刷废配额；
+    找不到 serial 时返 `{ok: false}` 而不是 404，让状态码无法用来做枚举探测
+
+- **查询审计日志 `verify_log`**
+  - `history.db` 里新表 `verify_log(id, ts, source, ip, serial, hit, ua)`
+    + 3 个索引（ts/serial/ip）；上限 500 k 行 FIFO 滚
+  - **两条路径都记**：`/api/verify`（staff，登录后查的）+
+    `/api/public/verify`（匿名）；`source` 字段区分；日志写失败永远
+    不会让查询失败
+  - 新接口 `GET /api/verify_log?limit=&offset=&source=&hit=&q=`——
+    auth-only，`q` 模糊搜 serial 或 IP；`/verify` 页底部新加
+    "🔎 Recent Verify Queries" 卡片渲染这个日志，hit/miss 绿√/红✕
+    badge，public/staff 两色标签
+
+- **PDF 模板: QR 下方一行 + QR 深链**
+  - 基础 HTML（`templates/legal_notice_full.html`）在 QR 和序列号之间
+    加了 `Scan to verify at <u>v.sspak.law</u>` 一行（衬线字体、URL
+    下划线加粗）
+  - QR payload 从原来的水印文案 `SS Legal Firm; for Respondent {name}`
+    改成 `<VERIFY_BASE_URL>?serial=<16-char-serial>`——手机扫码直接跳
+    转到公开验真页，**serial 自动预填**，用户只需解决 CAPTCHA 点 Verify
+  - 新环境变量 `VERIFY_BASE_URL`（默认 `https://v.sspak.law/public/verify`）；
+    QR 里的 URL、PDF 上印的域名（"v.sspak.law"）、`<a href>` 都从这一
+    个常量派生，不会漂
+  - `/public/verify` JS 在 boot 时解析 `window.location.search.serial`，
+    用 `URLSearchParams` 清洗后按 4-4-4-4 分组写回输入框，`setTimeout`
+    400ms 后跳焦到数学题答案框
+
+- **单色盾牌 logo（三个页面，不圆切）**
+  - 启动时从 `templates/static/images/logo_mono.png` 读字节 base64-
+    encode 进 `LOGO_MONO_DATA_URI`；文件缺失时 silently fallback 到
+    现有金色 logo
+  - `/verify`、`/inventory`、`/public/verify` 三页的 header img 都
+    改成 `height:44/56px; width:auto; max-width:96/120px;
+    object-fit:contain`——**不再 `border-radius: 50%` 圆切**，按原始
+    比例显示
+  - 工作台 `/`、`/login`、生成 PDF 里的 logo 不动（继续用金色）
+
+- **32 位访问密码**
+  - `_DEFAULT_PASSWORD` 从 20 位换成 32 位；字符池 `[A-Za-z0-9] +
+    ~!@#%^*-_=+?.`——刻意规避 `$ \`\` \\ \" ' < > | ; & / 空格`
+    等所有 shell / URL / Python string / env-file 引号转义陷阱
+  - 生产部署走 `LEGAL_NOTICE_PASSWORD` env var 覆盖，代码默认值只作
+    兜底
+
+### 变更
+
+- **默认模板邮箱**：`DEFAULT_BLOCKS_TEXT["page-footer"]` + 基础 HTML
+  两处 contact 里的 `sandslawfirm3187@gmail.com` → `J@sspak.law`
+- **模板对象锁定（`TEMPLATES_LOCKED = True`）**——**不影响内容编辑**
+  - 仅内置 `default` 模板存在，不可新建 / 删除 / 改名；body / 水印 /
+    图片依然可以在 UI 里自由编辑，修改持久化到 `uploads/templates/default/`
+  - 端点级别：`POST /api/templates` 和 `DELETE /api/templates/<slug>`
+    返 403（有详细 error 消息）；`PUT /api/templates/<slug>` 里如果
+    body 带 `name` 字段，会被静默丢弃（rename 无效、但其它字段 OK）
+  - UI 层面：侧栏 Section 1 里 Rename / Save as new / Delete / 模板
+    名输入框隐藏（`.tpl-write` class + `body.templates-locked` CSS 切），
+    标题加 `🔒 built-in · sole template` 徽章；Section 2 Body / 3 Images
+    / 4 Watermark 全部保留可编辑
+  - 启动清理 `_cleanup_non_builtin_template_dirs()`：扫
+    `uploads/templates/`，只删非 `default` 的目录——**`default/`
+    overlay 被保留**，staff 对模板的编辑跨重启幸存
+  - 回退钩子：`TEMPLATES_LOCKED = False` 一行切换，UI + API 同时恢复
+    CRUD
+
+### 架构要点
+
+- **公开端点的信任链**：`_AUTH_EXEMPT_PATHS` 白名单三条路径；CAPTCHA
+  token 永远是单次消费（数学题自己实现、Turnstile 由 CF 保证）；限流
+  在进 CAPTCHA 验证之前就拦，防止一个失效 token 就把 CAPTCHA provider
+  打爆
+- **QR vs 印出的 serial 的关系**：QR 是 URL 载入便利，印出来的 serial
+  是 fallback——扫不了的人手打也能验；两者编码的是同一个
+  `generate_qr_serial(name)`，`build_notice_html` 里只计算一次
+
+### 新增 API 端点
+
+| 方法 | 路径 | 用途 | 需登录 |
+|---|---|---|---|
+| `GET` | `/public/verify` | 公开验真 HTML 页 | ❌ |
+| `GET` | `/api/public/verify/challenge` | math 模式领 CAPTCHA token | ❌ |
+| `POST` | `/api/public/verify` | `{serial, turnstile_token\|captcha_token+answer}` → `{ok, name, principal, generated_at}` 或 `{ok:false}` | ❌ |
+| `GET` | `/api/verify_log` | 分页审计日志 `?source=&hit=&q=` | ✔ |
+
+### 新增环境变量
+
+| 变量 | 默认 | 用途 |
+|---|---|---|
+| `PUBLIC_VERIFY_ENABLED` | `1` | 开/关公开验真端点，`0` 则三条路径都返 404 |
+| `TURNSTILE_SITE_KEY` | 空 | Turnstile site key（前端 widget 用） |
+| `TURNSTILE_SECRET_KEY` | 空 | Turnstile secret（后端 verify 用）；任一为空就 fallback 数学题 |
+| `VERIFY_BASE_URL` | `https://v.sspak.law/public/verify` | 写进 QR 的深链 base；显示的域名也从这派生 |
+
 ## 2026-04-18 (存量下载模式)
 
 全新工作流：一次性把整批案件导入系统，之后只需搜索、选择、生成律师函——
