@@ -87,6 +87,16 @@
     再重新下载）
   - Advanced 里可改 `group_by_field` 列名，或传 `__none__` 明确不分组
 
+- **「按字段分组打包」开关 (`grouped: bool`)**
+  - Generate 卡 Profile 旁新加 checkbox「按字段分组打包」，默认开
+  - 开 → 当前行为：`batch-NNN.zip / <负责人>.zip / <pdf>` 嵌套结构
+  - 关 → 平铺：`batch-NNN.zip / <pdf>`，无子 zip 层；`_wrap_inventory_batch`
+    直接把唯一 inner zip 里的 PDF 抽出来写到外层
+  - 关时 UI 自动置灰 Advanced 里的 `Group by` 输入（后端也强制忽略该字段）
+  - API 变化：`POST /api/cases/generate` 接受 `grouped: bool`（default
+    `true`）；`grouped=false` 时 `group_by_field` 被强制置 `None`
+  - 动机：有些用户希望直接拿到一包 PDF 不分文件夹，方便按时间顺序扫过
+
 ### 变更
 
 - 工作台 header 加 📦 **Inventory** 和 🔍 **Verify** 两个导航链接

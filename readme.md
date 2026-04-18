@@ -265,11 +265,12 @@ sudo bash deploy/setup.sh
                           ├── original_name 列保留导入原名做审计
                           └── Dedupe by name / CNIC
 
-4. Generate           ──► 默认按 `负责人` 分组
-                          ├── 每组一个 <负责人>.zip
-                          └── 全部合并为 YYYY-MM-DD_batch-NNN.zip
-                              · ZIP_STORED（内层已压过，不重复压）
-                              · 持久化到 uploads/inventory_batches/
+4. Generate           ──► 「按字段分组打包」开关（默认开）
+                          ├── 开：batch-NNN.zip / <负责人>.zip / <pdf>
+                          │       （一个负责人一个子 zip）
+                          ├── 关：batch-NNN.zip / <pdf>
+                          │       （所有 PDF 平铺，无子 zip 层）
+                          └── ZIP_STORED · 持久化到 uploads/inventory_batches/
 ```
 
 ### 关键交互
@@ -298,12 +299,18 @@ Enter 保存 / Esc 撤销。保存后：
 
 这样改名立即对下次搜索和生成都生效，但原名仍留作审计。
 
-**外层批次 zip**：`/api/cases/generate` 默认 `group_by_field = "负责人"`。
-后端执行完 `generate_notices_html` 后，`_wrap_inventory_batch` 把所有分组
-zip 用 `ZIP_STORED` 打成一个外层 zip，命名 `YYYY-MM-DD_batch-NNN.zip`
-（`NNN` 扫当日目录 max+1），放在 `uploads/inventory_batches/`。外层 zip
-标 `persistent=True`，`/download` 对这种 part 跳过 10 分钟清理计时器——
-几天后还能重新下载，天然审计归档。
+**外层批次 zip + 分组开关**：`/api/cases/generate` 接受 `grouped: bool`
+（默认 `true`）：
+
+- `grouped=true`：按 `group_by_field`（默认 `负责人`）切子 zip → 外层嵌套
+  `batch-NNN.zip → <负责人>.zip → <pdf>`
+- `grouped=false`：跳过分组，所有 PDF 平铺 `batch-NNN.zip → <pdf>`
+
+两种布局的外层 zip 都命名 `YYYY-MM-DD_batch-NNN.zip`（`NNN` 扫当日目录
+`max+1`，`_BATCH_COUNTER_LOCK` 并发安全），用 `ZIP_STORED` 无压缩（内容
+已经 DEFLATE/rasterized 过），放在 `uploads/inventory_batches/`，标
+`persistent=True`；`/download` 对这种 part 跳过 10 分钟清理计时器——几
+天后还能重新下载，天然审计归档。
 
 ### 存储
 
@@ -370,7 +377,7 @@ uploads/
 | `POST` | `/api/cases/by_ids` | `{order_ids:[]}` → `{rows:[{order_id, name, original_name, cnic, phone}]}`；前端"已选"面板补 meta |
 | `POST` | `/api/cases/update_name` | `{order_id, name}` → 同步更新 `cases.name` + `row_json["name"]`；`original_name` 不动 |
 | `POST` | `/api/cases/delete` | `{order_ids:[]}` 或 `{all:true}` → `{deleted}` |
-| `POST` | `/api/cases/generate` | `{template_slug, order_ids[], date_value?, manual_fields?, filename_fields?, group_by_field?, machine?}` → `{task_id, row_count}`；默认 `group_by_field="负责人"`；复用 `/status` + `/download` |
+| `POST` | `/api/cases/generate` | `{template_slug, order_ids[], date_value?, manual_fields?, filename_fields?, grouped?:bool(default true), group_by_field?, machine?}` → `{task_id, row_count}`；`grouped=true` 默认 `group_by_field="负责人"`，`grouped=false` 则全部 PDF 平铺在总 zip 里；复用 `/status` + `/download` |
 
 生成完会在 `uploads/inventory_batches/` 下落一个持久化的
 `YYYY-MM-DD_batch-NNN.zip`，外层是 `ZIP_STORED`、内层每个 `<负责人>.zip`。

@@ -1500,15 +1500,26 @@ def _next_batch_number(date_str):
         return (max(used) + 1) if used else 1
 
 
-def _wrap_inventory_batch(task_id):
-    """Post-process an inventory-mode generate task: bundle every group
-    zip into a single outer zip named `YYYY-MM-DD_batch-NNN.zip`,
-    replace the task's ready_parts with that single entry, and delete
-    the now-redundant per-group zips from the working dir. No-op if the
-    task isn't in a terminal `done` state or has no parts.
+def _wrap_inventory_batch(task_id, grouped=True):
+    """Post-process an inventory-mode generate task.
 
-    The outer zip is ZIP_STORED because the inner zips are already
-    DEFLATED — re-compressing them wastes CPU for no size gain.
+    Always produces a single persistent outer zip named
+    `YYYY-MM-DD_batch-NNN.zip` in `INVENTORY_BATCH_DIR`, replaces the
+    task's ready_parts with one entry pointing at it, and removes the
+    per-group working zips. No-op if the task isn't in `done` state.
+
+    Two layouts:
+    - `grouped=True`  (default): nest each group zip as an inner zip
+      — `batch.zip / <负责人>.zip / <pdf>`. Used when the user wants a
+      clean per-collector folder structure.
+    - `grouped=False`: flatten — extract every PDF from the single
+      ungrouped zip and write them at the top level of the outer zip
+      (`batch.zip / <pdf>`). Avoids the redundant single-inner-zip
+      wrapper when no grouping is requested.
+
+    ZIP_STORED in both branches: inner zips are already DEFLATED and
+    PDFs here are already rasterized-then-compressed, so re-compressing
+    just wastes CPU.
     """
     task = _get_task(task_id)
     if not task or task.get("status") != "done":
@@ -1522,35 +1533,58 @@ def _wrap_inventory_batch(task_id):
     outer_name = f"{today}_batch-{batch_num:03d}.zip"
     outer_path = os.path.join(INVENTORY_BATCH_DIR, outer_name)
 
-    inner_taken = set()
+    taken = set()
+    pdf_count = 0
+    inner_count = 0
     with zipfile.ZipFile(outer_path, "w", zipfile.ZIP_STORED) as outer:
         for p in parts:
             src = p.get("path")
             if not src or not os.path.exists(src):
                 continue
-            # Respect user-visible inner name (already includes the
-            # 负责人 value, sanitized). Dedupe if two groups collapsed
-            # to the same safe name.
-            arcname = p.get("name") or os.path.basename(src)
-            base = arcname
-            n = 1
-            while arcname in inner_taken:
-                n += 1
-                stem, ext = os.path.splitext(base)
-                arcname = f"{stem}_{n}{ext}"
-            inner_taken.add(arcname)
-            outer.write(src, arcname)
+            if grouped:
+                # Nest: keep each group zip as an inner zip so the
+                # user sees one folder per 负责人 after unzip.
+                arcname = p.get("name") or os.path.basename(src)
+                base = arcname
+                n = 1
+                while arcname in taken:
+                    n += 1
+                    stem, ext = os.path.splitext(base)
+                    arcname = f"{stem}_{n}{ext}"
+                taken.add(arcname)
+                outer.write(src, arcname)
+                inner_count += 1
+            else:
+                # Flat: pull every PDF out of this group zip and write
+                # it at top level. Dedupe across parts (shouldn't happen
+                # in the ungrouped path since there's only one part,
+                # but defensive).
+                with zipfile.ZipFile(src, "r") as inner:
+                    for info in inner.infolist():
+                        if info.is_dir():
+                            continue
+                        pdf_name = info.filename
+                        base = pdf_name
+                        n = 1
+                        while pdf_name in taken:
+                            n += 1
+                            stem, ext = os.path.splitext(base)
+                            pdf_name = f"{stem}_{n}{ext}"
+                        taken.add(pdf_name)
+                        with inner.open(info) as f:
+                            outer.writestr(pdf_name, f.read())
+                        pdf_count += 1
 
-    # Delete the per-group zips now that they're bundled.
+    # Delete the per-group working zips now that they're consumed.
     for p in parts:
         src = p.get("path")
         if src and os.path.exists(src):
             try: os.remove(src)
             except OSError: pass
 
-    # Replace ready_parts with a single persistent entry. `persistent`
+    # Replace ready_parts with one persistent entry. `persistent=True`
     # tells /download/<tid>/<idx> to skip the 10-minute cleanup timer
-    # so the batch zip stays available for re-download.
+    # so the batch stays downloadable days later.
     with TASKS_LOCK:
         t = TASKS.get(task_id)
         if t is not None:
@@ -1560,10 +1594,16 @@ def _wrap_inventory_batch(task_id):
                 "group": "batch",
                 "path": outer_path,
                 "persistent": True,
-                "inner_count": len(inner_taken),
+                "grouped": grouped,
+                "inner_count": inner_count,
+                "pdf_count": pdf_count,
             }]
-            t["message"] = (
-                f"Packed {len(inner_taken)} group zip(s) into {outer_name}")
+            if grouped:
+                t["message"] = (
+                    f"Packed {inner_count} group zip(s) into {outer_name}")
+            else:
+                t["message"] = (
+                    f"Packed {pdf_count} PDF(s) flat into {outer_name}")
 
 
 def _parse_multi_values(q):
@@ -3537,13 +3577,22 @@ def api_cases_generate():
 
     manual_fields   = payload.get("manual_fields") or {}
     filename_fields = payload.get("filename_fields") or ["name"]
-    # Inventory mode's standard output shape is "one zip per 负责人,
-    # all bundled into a dated batch zip". Caller can override with an
-    # explicit column name or pass "__none__" to skip grouping.
-    group_by_field  = payload.get("group_by_field")
-    if group_by_field is None or group_by_field == "":
-        group_by_field = "负责人"
-    elif group_by_field == "__none__":
+    # `grouped` (default True) is the top-level switch: turn it off and
+    # the batch zip is flat — every PDF at top level, no per-collector
+    # inner zips. `group_by_field` (default 负责人) controls which
+    # column drives the inner-zip split when `grouped` is True; it's
+    # ignored when `grouped` is False.
+    grouped = bool(payload.get("grouped", True))
+    if grouped:
+        group_by_field = payload.get("group_by_field")
+        if group_by_field is None or group_by_field == "":
+            group_by_field = "负责人"
+        elif group_by_field == "__none__":
+            # Ugly backdoor kept for API compatibility: explicitly
+            # requesting __none__ in grouped mode still disables the
+            # split.
+            group_by_field = None
+    else:
         group_by_field = None
     profile         = _get_machine_profile(payload.get("machine"))
 
@@ -3560,9 +3609,10 @@ def api_cases_generate():
                 render_workers=profile["render_workers"],
                 profile_label=profile["label"],
             )
-            # Bundle per-group zips into one dated batch zip so the user
-            # downloads a single file instead of N per-group links.
-            _wrap_inventory_batch(task_id)
+            # Always wrap into a single dated batch zip — the `grouped`
+            # flag flips between nested (inner <负责人>.zip) and flat
+            # (PDFs at top level) layouts.
+            _wrap_inventory_batch(task_id, grouped=grouped)
         except Exception as e:
             traceback.print_exc()
             _update_task(task_id, status="error", stage="error",
@@ -5165,6 +5215,17 @@ INVENTORY_TEMPLATE = r"""
   #selectedTable td.del button:hover {
     background:#fdecec; color:var(--err);
   }
+  .toggle-lbl { display:inline-flex; align-items:center; gap:6px;
+                font-size:.82rem; color:#333; cursor:pointer;
+                padding:6px 10px; border:1px solid var(--border);
+                border-radius:5px; background:#faf8f3; user-select:none; }
+  .toggle-lbl input { margin:0; }
+  .toggle-lbl:has(input:checked) { background:#fffbe8;
+                                   border-color:var(--accent);
+                                   color:var(--primary); font-weight:600; }
+  input[disabled] + span,
+  input[disabled] { opacity:.5; cursor:not-allowed; }
+
   #selectedTable th.money-head,
   #selectedTable td.money { text-align:right; padding-right:12px;
                             font-variant-numeric:tabular-nums;
@@ -5396,6 +5457,11 @@ INVENTORY_TEMPLATE = r"""
         <option value="vps">VPS (conservative)</option>
         <option value="mac">Mac (max)</option>
       </select>
+
+      <label class="toggle-lbl" title="开：zip 里按 负责人 分成子 zip · 关：全部 PDF 平铺在总 zip 里">
+        <input type="checkbox" id="groupedToggle" checked>
+        按字段分组打包
+      </label>
     </div>
 
     <details class="advanced">
@@ -5406,7 +5472,11 @@ INVENTORY_TEMPLATE = r"""
                placeholder="comma-separated, e.g. name,cnic"
                value="name,cnic">
         <label style="font-size:.82rem; color:#555;">Group by</label>
-        <input type="text" id="groupBy" placeholder="column (default: 负责人 · type __none__ to skip)">
+        <input type="text" id="groupBy" placeholder="column (default: 负责人)">
+      </div>
+      <div class="muted" style="font-size:.72rem; margin-top:4px;">
+        Group by 只在上方「按字段分组打包」开启时生效。关闭时总 zip 里
+        就是所有 PDF 的平铺列表，没有子 zip。
       </div>
     </details>
 
@@ -5993,17 +6063,26 @@ function updateSelN() {
 }
 
 // ── GENERATE ────────────────────────────────────────────────
+$('groupedToggle').addEventListener('change', () => {
+  const on = $('groupedToggle').checked;
+  $('groupBy').disabled = !on;
+});
+
 $('generateBtn').onclick = async () => {
   if (state.selected.size === 0) return;
   const order_ids = [...state.selected];
+  const grouped = $('groupedToggle').checked;
   const body = {
     template_slug: $('tplSelect').value,
     order_ids,
     date_value: $('dateInput').value || '',
     machine: $('profileSelect').value,
+    grouped,
     filename_fields: ($('fnFields').value || 'name')
                      .split(',').map(s => s.trim()).filter(Boolean),
-    group_by_field: ($('groupBy').value || '').trim() || null,
+    group_by_field: grouped
+      ? (($('groupBy').value || '').trim() || null)
+      : null,
   };
   $('generateBtn').disabled = true;
   $('genDownloads').innerHTML = '';
