@@ -258,6 +258,9 @@ sudo bash deploy/setup.sh
                           └── Bulk match：粘贴 / 上传 Excel 关键字列
 
 3. Review & Edit      ──► 已选面板独立展示 N 条
+                          ├── 列：order_id / name / cnic / phone /
+                          │       负责人 / Principal / Interest /
+                          │       Penalty / Payable
                           ├── 单元格内联改 name（Enter 保存）
                           ├── original_name 列保留导入原名做审计
                           └── Dedupe by name / CNIC

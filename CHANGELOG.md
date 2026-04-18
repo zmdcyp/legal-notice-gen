@@ -63,6 +63,16 @@
     保存成功底部小字显示 `orig: <原名>`，已选面板 `(edited)` 小标 + title
     tooltip
 
+- **已选面板扩列：`负责人` + 4 个金额字段**
+  - Selected Cases 表新加 5 列：`负责人 / Principal / Interest / Penalty /
+    Payable`——金额列右对齐 + 等宽字体 + 千分位（导入时就格式化过的
+    `1,234.00`）
+  - 实现走 **extract-on-read**：新增 `_extract_display_extras(row_json)`
+    在 `/api/cases/by_ids`、`/search`（三种模式都走）、`/bulk_match` 的
+    SELECT 里一起拉 `row_json`，服务端反序列化抽字段——不改 schema，不
+    加冗余列，未来要加别的展示字段只改一个常量元组 `_DISPLAY_EXTRA_FIELDS`
+  - 动机：确认分组和金额一眼看清，不用点开 PDF 核对
+
 - **外层批次 zip + 按 `负责人` 分组（默认）**
   - `POST /api/cases/generate` 默认 `group_by_field = "负责人"`——每个
     负责人一个 `<负责人>.zip`，再用 `ZIP_STORED` 打进外层

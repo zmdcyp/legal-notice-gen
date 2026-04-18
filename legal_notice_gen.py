@@ -1603,6 +1603,29 @@ def _cases_temp_values_table(conn, values):
                      [(v,) for v in values])
 
 
+# Fields surfaced in the Selected-panel table beyond the indexed
+# columns. They live in `row_json` only (not indexed, not searched),
+# so we peek them out on the read path instead of duplicating as
+# SQL columns. Order is the UI column order.
+_DISPLAY_EXTRA_FIELDS = (
+    "负责人", "Principal_Amount", "Interest", "Penalty", "Payable")
+
+
+def _extract_display_extras(row_json_str):
+    """Return a {field: value} dict for the extra display columns,
+    empty-string for anything missing. Silently tolerant of malformed
+    JSON so one bad row can't break the whole page."""
+    try:
+        d = json.loads(row_json_str) if row_json_str else {}
+    except (ValueError, TypeError):
+        return {k: "" for k in _DISPLAY_EXTRA_FIELDS}
+    out = {}
+    for k in _DISPLAY_EXTRA_FIELDS:
+        v = d.get(k)
+        out[k] = "" if v is None else v
+    return out
+
+
 def _cases_fetch_rows(ids):
     """Load row_json for a list of order_ids, preserving input order.
     Returns (rows_in_order, missing_ids)."""
@@ -3136,8 +3159,9 @@ def api_cases_search():
         if not values:
             total = conn.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
             rows = conn.execute(
-                "SELECT order_id, cnic, name, original_name, phone, created_at "
-                "FROM cases ORDER BY order_id LIMIT ? OFFSET ?",
+                "SELECT order_id, cnic, name, original_name, phone, "
+                "created_at, row_json FROM cases "
+                "ORDER BY order_id LIMIT ? OFFSET ?",
                 (limit, offset)).fetchall()
             mode = "all"
         elif len(values) == 1:
@@ -3146,8 +3170,8 @@ def api_cases_search():
                 f"SELECT COUNT(*) FROM cases WHERE {field} LIKE ?",
                 (v + "%",)).fetchone()[0]
             rows = conn.execute(
-                f"SELECT order_id, cnic, name, original_name, phone, created_at "
-                f"FROM cases WHERE {field} LIKE ? "
+                f"SELECT order_id, cnic, name, original_name, phone, "
+                f"created_at, row_json FROM cases WHERE {field} LIKE ? "
                 f"ORDER BY order_id LIMIT ? OFFSET ?",
                 (v + "%", limit, offset)).fetchall()
             mode = "prefix"
@@ -3158,15 +3182,22 @@ def api_cases_search():
                 f"JOIN _srch_q q ON c.{field} = q.v").fetchone()[0]
             rows = conn.execute(
                 f"SELECT DISTINCT c.order_id, c.cnic, c.name, "
-                f"c.original_name, c.phone, c.created_at FROM cases c "
+                f"c.original_name, c.phone, c.created_at, c.row_json "
+                f"FROM cases c "
                 f"JOIN _srch_q q ON c.{field} = q.v "
                 f"ORDER BY c.order_id LIMIT ? OFFSET ?",
                 (limit, offset)).fetchall()
             mode = "exact"
+
+    enriched = []
+    for r in rows:
+        row = dict(r)
+        row.update(_extract_display_extras(row.pop("row_json", "")))
+        enriched.append(row)
     return jsonify(
         total=total, page=page, limit=limit,
         mode=mode, values_parsed=len(values),
-        rows=[dict(r) for r in rows],
+        rows=enriched,
     )
 
 
@@ -3249,10 +3280,12 @@ def api_cases_by_ids():
             chunk = ids[i:i + 500]
             qs = ",".join("?" * len(chunk))
             for r in conn.execute(
-                    f"SELECT order_id, name, original_name, cnic, phone "
-                    f"FROM cases WHERE order_id IN ({qs})",
+                    f"SELECT order_id, name, original_name, cnic, phone, "
+                    f"row_json FROM cases WHERE order_id IN ({qs})",
                     tuple(chunk)):
-                out.append(dict(r))
+                row = dict(r)
+                row.update(_extract_display_extras(row.pop("row_json")))
+                out.append(row)
     return jsonify(rows=out)
 
 
@@ -3396,17 +3429,19 @@ def api_cases_bulk_match():
         _cases_temp_values_table(conn, values)
         for r in conn.execute(
                 f"SELECT c.order_id, c.name, c.original_name, c.cnic, "
-                f"c.phone, c.{field} AS matched_v "
+                f"c.phone, c.row_json, c.{field} AS matched_v "
                 f"FROM cases c JOIN _srch_q q ON c.{field} = q.v "
                 f"ORDER BY c.order_id"):
             matched_ids.append(r["order_id"])
             matched_value_set.add(r["matched_v"])
             if len(matched_meta) < 200:
-                matched_meta.append({
+                meta = {
                     "order_id": r["order_id"], "name": r["name"],
                     "original_name": r["original_name"],
                     "cnic": r["cnic"], "phone": r["phone"],
-                })
+                }
+                meta.update(_extract_display_extras(r["row_json"]))
+                matched_meta.append(meta)
     missing = [v for v in values if v not in matched_value_set]
     return jsonify(
         field=field,
@@ -5130,6 +5165,13 @@ INVENTORY_TEMPLATE = r"""
   #selectedTable td.del button:hover {
     background:#fdecec; color:var(--err);
   }
+  #selectedTable th.money-head,
+  #selectedTable td.money { text-align:right; padding-right:12px;
+                            font-variant-numeric:tabular-nums;
+                            white-space:nowrap; }
+  #selectedTable td.money { font-family:ui-monospace,"SF Mono",monospace;
+                            font-size:.78rem; }
+  #selectedTable td.money.zero { color:#aaa; }
 
   /* Inline-editable name cell in search results */
   td.name-cell { padding:6px 10px; transition:background .25s; }
@@ -5325,10 +5367,15 @@ INVENTORY_TEMPLATE = r"""
             <th>Name</th>
             <th>CNIC</th>
             <th>Phone</th>
+            <th>负责人</th>
+            <th class="money-head">Principal</th>
+            <th class="money-head">Interest</th>
+            <th class="money-head">Penalty</th>
+            <th class="money-head">Payable</th>
           </tr>
         </thead>
         <tbody id="selectedBody">
-          <tr><td colspan="5" class="muted">Nothing selected yet.</td></tr>
+          <tr><td colspan="10" class="muted">Nothing selected yet.</td></tr>
         </tbody>
       </table>
     </div>
@@ -5870,7 +5917,7 @@ function renderSelectedPanel() {
   const body = $('selectedBody');
   if (n === 0) {
     body.innerHTML =
-      '<tr><td colspan="5" class="muted">Nothing selected yet. '
+      '<tr><td colspan="10" class="muted">Nothing selected yet. '
       + 'Check rows in the search table, click "Select all matching", '
       + 'or use "Bulk select from file" above.</td></tr>';
     $('selTruncateNote').textContent = '';
@@ -5890,6 +5937,11 @@ function renderSelectedPanel() {
       ${nameTd}
       <td class="mono">${H(m.cnic)}</td>
       <td class="mono">${H(m.phone)}</td>
+      <td class="mono">${H(m['负责人'])}</td>
+      <td class="money">${H(m.Principal_Amount)}</td>
+      <td class="money">${H(m.Interest)}</td>
+      <td class="money">${H(m.Penalty)}</td>
+      <td class="money">${H(m.Payable)}</td>
     </tr>`;
   }).join('');
   body.querySelectorAll('button[data-oid]').forEach(btn => {
