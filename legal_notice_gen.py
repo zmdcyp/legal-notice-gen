@@ -1348,6 +1348,284 @@ def lookup_notice_by_serial(serial):
     return dict(row) if row else None
 
 
+# ── cases store (inventory mode) ──────────────────────────────────
+#
+# Inventory mode keeps every imported case row in a SQLite table so the
+# user can bring in a whole portfolio once (hundreds of thousands of rows
+# from the same-format batch Excel) and then pick subsets by
+# CNIC / name / phone on demand — without re-uploading the spreadsheet
+# each time a letter needs to go out.
+#
+# Uniqueness key is the "订单编号" (order number) column. CNIC repeats
+# across multiple loans for the same borrower, but every loan has its
+# own order number, so that's what drives conflict handling on import.
+#
+# `row_json` stores the full original row as-is so render-time code can
+# consume it unchanged — including columns the current template doesn't
+# use (e.g. 负责人). The redundant cnic / name / phone columns exist only
+# to index the three supported search fields; they duplicate data from
+# row_json but let LIKE queries hit an index on a 500 k-row table.
+
+CASES_DB_PATH = os.path.join(UPLOAD_DIR, "cases.db")
+_CASES_LOCK = threading.Lock()   # serializes writers; WAL lets reads bypass
+
+CASES_IMPORTS_DIR = os.path.join(UPLOAD_DIR, "case_imports")
+os.makedirs(CASES_IMPORTS_DIR, exist_ok=True)
+
+# Excel header aliases. The real workload has Chinese-headed columns
+# (订单编号, 姓名, CNIC, 注册手机号) on one sheet and Latin-headed
+# (name, cnic, phone) on another — both come through the same importer.
+# First exact-match hit wins; a case-insensitive pass runs second.
+CASE_COL_ALIASES = {
+    "order_id": ("订单编号", "order_id", "Order_ID", "OrderID",
+                 "order id", "order no", "order_no"),
+    "cnic":     ("cnic", "CNIC", "身份证", "身份证号"),
+    "name":     ("name", "Name", "姓名"),
+    "phone":    ("phone", "Phone", "注册手机号", "手机号",
+                 "mobile", "Mobile"),
+}
+
+
+def _find_col(headers, aliases):
+    header_set = {h for h in headers if h}
+    for a in aliases:
+        if a in header_set:
+            return a
+    lower_map = {h.lower(): h for h in headers if h}
+    for a in aliases:
+        hit = lower_map.get(a.lower())
+        if hit:
+            return hit
+    return None
+
+
+def _init_cases_db():
+    with sqlite3.connect(CASES_DB_PATH) as conn:
+        # WAL so search queries don't block behind a 40-万-row import tx.
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS cases (
+                order_id      TEXT PRIMARY KEY,
+                cnic          TEXT,
+                name          TEXT,
+                original_name TEXT,
+                phone         TEXT,
+                row_json      TEXT NOT NULL,
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL
+            )
+        """)
+        # Backfill for DBs created before original_name existed. The
+        # ALTER is a no-op on fresh installs; the UPDATE seeds existing
+        # rows so "orig:" shows a real value after upgrade even for
+        # cases that were imported before the audit trail was added.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(cases)")}
+        if "original_name" not in cols:
+            conn.execute("ALTER TABLE cases ADD COLUMN original_name TEXT")
+        conn.execute(
+            "UPDATE cases SET original_name = name "
+            "WHERE original_name IS NULL")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_cnic  ON cases(cnic)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_name  ON cases(name)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_phone ON cases(phone)")
+        conn.commit()
+
+
+_init_cases_db()
+
+
+def _normalize_order_id(v):
+    """Coerce an order-id cell to a clean non-empty string, or None.
+
+    Real order numbers are 19-digit bigints (e.g. 7410924208336667649)
+    which overflow SQLite's INTEGER; always store as TEXT. Integer-valued
+    floats are de-scientific-notation'd first so the key survives
+    Excel's auto-typing ('3674103' stays '3674103', not '3674103.0').
+    """
+    if v is None:
+        return None
+    if isinstance(v, float):
+        if v.is_integer():
+            v = int(v)
+    s = str(v).strip()
+    return s or None
+
+
+def _cases_count():
+    with sqlite3.connect(CASES_DB_PATH) as conn:
+        return conn.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
+
+
+def _cases_existing_ids(ids):
+    """Return the subset of `ids` already present in the DB, chunked to
+    stay under SQLite's 999-parameter limit."""
+    if not ids:
+        return set()
+    found = set()
+    with sqlite3.connect(CASES_DB_PATH) as conn:
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            qs = ",".join("?" * len(chunk))
+            for (oid,) in conn.execute(
+                    f"SELECT order_id FROM cases WHERE order_id IN ({qs})",
+                    tuple(chunk)):
+                found.add(oid)
+    return found
+
+
+INVENTORY_BATCH_DIR = os.path.join(UPLOAD_DIR, "inventory_batches")
+os.makedirs(INVENTORY_BATCH_DIR, exist_ok=True)
+_BATCH_COUNTER_LOCK = threading.Lock()
+
+# Match "2026-04-18_batch-017.zip" — used to find the next counter
+# value for today's batches when naming the outer zip.
+_BATCH_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_batch-(\d{3})\.zip$")
+
+
+def _next_batch_number(date_str):
+    """Scan `INVENTORY_BATCH_DIR` for today's batches and return the
+    next sequence number. Serialized under `_BATCH_COUNTER_LOCK` so two
+    generate tasks firing back-to-back don't collide on the same N."""
+    with _BATCH_COUNTER_LOCK:
+        used = []
+        try:
+            for fn in os.listdir(INVENTORY_BATCH_DIR):
+                if not fn.startswith(date_str + "_"):
+                    continue
+                m = _BATCH_NAME_RE.match(fn)
+                if m:
+                    used.append(int(m.group(1)))
+        except OSError:
+            pass
+        return (max(used) + 1) if used else 1
+
+
+def _wrap_inventory_batch(task_id):
+    """Post-process an inventory-mode generate task: bundle every group
+    zip into a single outer zip named `YYYY-MM-DD_batch-NNN.zip`,
+    replace the task's ready_parts with that single entry, and delete
+    the now-redundant per-group zips from the working dir. No-op if the
+    task isn't in a terminal `done` state or has no parts.
+
+    The outer zip is ZIP_STORED because the inner zips are already
+    DEFLATED — re-compressing them wastes CPU for no size gain.
+    """
+    task = _get_task(task_id)
+    if not task or task.get("status") != "done":
+        return
+    parts = list(task.get("ready_parts") or [])
+    if not parts:
+        return
+
+    today = datetime.date.today().isoformat()
+    batch_num = _next_batch_number(today)
+    outer_name = f"{today}_batch-{batch_num:03d}.zip"
+    outer_path = os.path.join(INVENTORY_BATCH_DIR, outer_name)
+
+    inner_taken = set()
+    with zipfile.ZipFile(outer_path, "w", zipfile.ZIP_STORED) as outer:
+        for p in parts:
+            src = p.get("path")
+            if not src or not os.path.exists(src):
+                continue
+            # Respect user-visible inner name (already includes the
+            # 负责人 value, sanitized). Dedupe if two groups collapsed
+            # to the same safe name.
+            arcname = p.get("name") or os.path.basename(src)
+            base = arcname
+            n = 1
+            while arcname in inner_taken:
+                n += 1
+                stem, ext = os.path.splitext(base)
+                arcname = f"{stem}_{n}{ext}"
+            inner_taken.add(arcname)
+            outer.write(src, arcname)
+
+    # Delete the per-group zips now that they're bundled.
+    for p in parts:
+        src = p.get("path")
+        if src and os.path.exists(src):
+            try: os.remove(src)
+            except OSError: pass
+
+    # Replace ready_parts with a single persistent entry. `persistent`
+    # tells /download/<tid>/<idx> to skip the 10-minute cleanup timer
+    # so the batch zip stays available for re-download.
+    with TASKS_LOCK:
+        t = TASKS.get(task_id)
+        if t is not None:
+            t["ready_parts"] = [{
+                "index": 0,
+                "name": outer_name,
+                "group": "batch",
+                "path": outer_path,
+                "persistent": True,
+                "inner_count": len(inner_taken),
+            }]
+            t["message"] = (
+                f"Packed {len(inner_taken)} group zip(s) into {outer_name}")
+
+
+def _parse_multi_values(q):
+    """Split a search input into a deduped list of exact values.
+
+    One value falls through to the existing prefix-LIKE fast path; two
+    or more trigger an IN-style exact-match lookup. Splits on commas,
+    whitespace, and newlines so the same input works whether the user
+    typed a comma-separated list or pasted from a spreadsheet column.
+
+    Capped at 10k entries so a runaway paste can't eat the backend."""
+    if not q:
+        return []
+    parts = re.split(r"[\s,]+", q)
+    seen, out = set(), []
+    for p in parts:
+        p = p.strip()
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+        if len(out) >= 10_000:
+            break
+    return out
+
+
+def _cases_temp_values_table(conn, values):
+    """Materialize `values` into a per-connection TEMP table so queries
+    can JOIN against it — this bypasses SQLite's 999-bind-parameter cap
+    that an inline `IN (?,?,...)` would hit for multi-thousand lists.
+    The table is re-created each call so it's safe to reuse the same
+    connection for back-to-back searches."""
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS _srch_q (v TEXT PRIMARY KEY)")
+    conn.execute("DELETE FROM _srch_q")
+    conn.executemany("INSERT OR IGNORE INTO _srch_q VALUES (?)",
+                     [(v,) for v in values])
+
+
+def _cases_fetch_rows(ids):
+    """Load row_json for a list of order_ids, preserving input order.
+    Returns (rows_in_order, missing_ids)."""
+    by_id = {}
+    if ids:
+        with sqlite3.connect(CASES_DB_PATH) as conn:
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                qs = ",".join("?" * len(chunk))
+                for oid, payload in conn.execute(
+                        f"SELECT order_id, row_json FROM cases "
+                        f"WHERE order_id IN ({qs})", tuple(chunk)):
+                    by_id[oid] = json.loads(payload)
+    rows, missing = [], []
+    for oid in ids:
+        row = by_id.get(oid)
+        if row is None:
+            missing.append(oid)
+        else:
+            rows.append(row)
+    return rows, missing
+
+
 _ANY_OPEN_DIV = re.compile(r'<div\b[^>]*>')
 _ANY_CLOSE_DIV = re.compile(r'</div\s*>')
 
@@ -2061,6 +2339,15 @@ def verify_page():
     return Response(VERIFY_TEMPLATE, mimetype="text/html")
 
 
+@app.route("/inventory")
+def inventory_page():
+    """Inventory mode: bulk-import a case Excel once, then pick
+    subsets (by cnic / name / phone) to generate notices on demand.
+    `{{date}}` defaults to today, so the sidebar just needs a
+    date override field instead of the full manual placeholder form."""
+    return Response(INVENTORY_TEMPLATE, mimetype="text/html")
+
+
 @app.route("/api/templates", methods=["GET"])
 def api_list_templates():
     return jsonify(list_templates())
@@ -2217,13 +2504,16 @@ def download_part(task_id, part_index):
         return jsonify(error="Part file missing."), 404
 
     # Clean up this part's zip after a generous delay so retries work.
-    def delayed_cleanup():
-        try:
-            if os.path.exists(zip_path):
-                os.remove(zip_path)
-        except OSError:
-            pass
-    threading.Timer(600.0, delayed_cleanup).start()
+    # Persistent parts (inventory-mode batch zips) are kept on disk so
+    # the user can re-download days later; the batch dir holds history.
+    if not part.get("persistent"):
+        def delayed_cleanup():
+            try:
+                if os.path.exists(zip_path):
+                    os.remove(zip_path)
+            except OSError:
+                pass
+        threading.Timer(600.0, delayed_cleanup).start()
 
     return send_file(zip_path, mimetype="application/zip",
                      as_attachment=True, download_name=part["name"])
@@ -2572,6 +2862,682 @@ def api_history():
         rows=[dict(r) for r in rows])
 
 
+# ── inventory mode: /api/cases/* ──────────────────────────────────
+#
+# These endpoints back the /inventory page. Flow:
+#   1. Import Excel → preview (scan for 订单编号 conflicts)
+#   2. Commit with policy=skip|overwrite → async task
+#   3. Search by cnic/name/phone, paginate, accumulate selected order_ids
+#   4. Generate notices for the selection → feeds the existing batch
+#      render pipeline (generate_notices_html) unchanged.
+#
+# /status/<task_id> and /download/<task_id>/<part_index> are shared with
+# the Excel-batch flow — the TASKS dict is generic, import tasks just
+# never populate ready_parts.
+
+_CASES_TOKEN_RE = re.compile(r"[0-9a-f]{32}")
+
+
+@app.route("/api/cases/stats", methods=["GET"])
+def api_cases_stats():
+    return jsonify(count=_cases_count())
+
+
+@app.route("/api/cases/import/preview", methods=["POST"])
+def api_cases_import_preview():
+    """Stage 1 of import. Accepts the Excel, stashes it on disk,
+    streams through once to count rows + collect 订单编号 conflicts.
+    Returns a token the client passes back to /commit. No DB writes yet.
+
+    For a 40-万-row sheet this is the slow step (~20-40 s); keep it
+    synchronous because the preview numbers drive the confirm dialog."""
+    excel_file = request.files.get("excel")
+    if not excel_file:
+        return jsonify(error="Please upload an Excel file."), 400
+    token = uuid.uuid4().hex
+    stash_path = os.path.join(CASES_IMPORTS_DIR, f"{token}.xlsx")
+    excel_file.save(stash_path)
+    try:
+        wb = openpyxl.load_workbook(stash_path, read_only=True, data_only=True)
+        ws = wb.active
+        rows_iter = ws.iter_rows(values_only=True)
+        try:
+            header_row = next(rows_iter)
+        except StopIteration:
+            wb.close()
+            try: os.remove(stash_path)
+            except OSError: pass
+            return jsonify(error="Excel is empty."), 400
+        headers = [str(h).strip() if h is not None else "" for h in header_row]
+        oid_col = _find_col(headers, CASE_COL_ALIASES["order_id"])
+        if not oid_col:
+            wb.close()
+            try: os.remove(stash_path)
+            except OSError: pass
+            return jsonify(
+                error=("No order-id column found. Expected one of: "
+                       + ", ".join(CASE_COL_ALIASES["order_id"]))), 400
+        oid_idx = headers.index(oid_col)
+
+        # Stream order_ids only — we don't need the full row dict here.
+        all_ids = []
+        seen = set()
+        dup_in_file = set()
+        for row in rows_iter:
+            if oid_idx >= len(row):
+                continue
+            v = _normalize_order_id(row[oid_idx])
+            if not v:
+                continue
+            if v in seen:
+                dup_in_file.add(v)
+            else:
+                seen.add(v)
+                all_ids.append(v)
+        wb.close()
+
+        existing = _cases_existing_ids(all_ids)
+        return jsonify(
+            token=token,
+            total=len(all_ids),
+            new_count=len(all_ids) - len(existing),
+            conflict_count=len(existing),
+            conflicts_sample=list(existing)[:100],
+            dup_in_file_count=len(dup_in_file),
+            dup_in_file_sample=list(dup_in_file)[:20],
+            headers=[h for h in headers if h],
+            order_id_col=oid_col,
+            cnic_col=_find_col(headers, CASE_COL_ALIASES["cnic"]),
+            name_col=_find_col(headers, CASE_COL_ALIASES["name"]),
+            phone_col=_find_col(headers, CASE_COL_ALIASES["phone"]),
+        )
+    except Exception as e:
+        try: os.remove(stash_path)
+        except OSError: pass
+        traceback.print_exc()
+        return jsonify(error=f"Preview failed: {e}"), 400
+
+
+def _cases_import_worker(task_id, stash_path, policy):
+    """Async committer. Reads the stashed Excel and upserts rows per
+    policy; updates TASKS[task_id] progress as it goes."""
+    try:
+        _update_task(task_id, status="running", stage="reading",
+                     message="Reading Excel…")
+        headers, data_rows = read_excel(stash_path)
+        oid_col  = _find_col(headers, CASE_COL_ALIASES["order_id"])
+        cnic_col = _find_col(headers, CASE_COL_ALIASES["cnic"])
+        name_col = _find_col(headers, CASE_COL_ALIASES["name"])
+        phone_col = _find_col(headers, CASE_COL_ALIASES["phone"])
+        if not oid_col:
+            raise ValueError("order-id column missing (file changed?)")
+        total = len(data_rows)
+        _update_task(task_id, stage="inserting",
+                     total=total, progress=0,
+                     message=f"Importing {total} rows…")
+        now = datetime.datetime.now().isoformat(timespec="seconds")
+        inserted = updated = skipped_existing = skipped_blank = dups_in_file = 0
+        BATCH = 1000
+        seen_this_run = set()
+
+        # One long-lived writer holds _CASES_LOCK; WAL lets concurrent
+        # readers (search endpoints) keep working.
+        with _CASES_LOCK, sqlite3.connect(CASES_DB_PATH) as conn:
+            conn.execute("BEGIN")
+            try:
+                for i, row in enumerate(data_rows, 1):
+                    oid = _normalize_order_id(row.get(oid_col))
+                    if not oid:
+                        skipped_blank += 1
+                        continue
+                    if oid in seen_this_run:
+                        dups_in_file += 1
+                        # In-file duplicates: let the last occurrence win
+                        # under overwrite; drop duplicates under skip.
+                        if policy != "overwrite":
+                            continue
+                    seen_this_run.add(oid)
+
+                    # Normalize every cell so numbers match what the
+                    # existing batch pipeline would produce on its own
+                    # read — JSON round-trip stays value-preserving for
+                    # strings / ints / floats.
+                    row_out = {k: v for k, v in row.items() if k}
+                    payload = json.dumps(row_out, ensure_ascii=False,
+                                         default=str)
+                    cnic_v  = str(row.get(cnic_col,  "") or "") if cnic_col  else ""
+                    name_v  = str(row.get(name_col,  "") or "") if name_col  else ""
+                    phone_v = str(row.get(phone_col, "") or "") if phone_col else ""
+
+                    if policy == "overwrite":
+                        # Overwrite explicitly replaces the row's view of
+                        # "truth", so original_name resets to the newly
+                        # imported name — later inline edits are still
+                        # reversible back to "what this import said".
+                        cur = conn.execute(
+                            "UPDATE cases SET cnic=?, name=?, "
+                            "original_name=?, phone=?, row_json=?, "
+                            "updated_at=? WHERE order_id=?",
+                            (cnic_v, name_v, name_v, phone_v, payload,
+                             now, oid))
+                        if cur.rowcount == 0:
+                            conn.execute(
+                                "INSERT INTO cases(order_id, cnic, name, "
+                                "original_name, phone, row_json, "
+                                "created_at, updated_at) "
+                                "VALUES (?,?,?,?,?,?,?,?)",
+                                (oid, cnic_v, name_v, name_v, phone_v,
+                                 payload, now, now))
+                            inserted += 1
+                        else:
+                            updated += 1
+                    else:  # skip
+                        cur = conn.execute(
+                            "INSERT OR IGNORE INTO cases(order_id, cnic, "
+                            "name, original_name, phone, row_json, "
+                            "created_at, updated_at) "
+                            "VALUES (?,?,?,?,?,?,?,?)",
+                            (oid, cnic_v, name_v, name_v, phone_v,
+                             payload, now, now))
+                        if cur.rowcount == 1:
+                            inserted += 1
+                        else:
+                            skipped_existing += 1
+
+                    if i % BATCH == 0:
+                        conn.commit()
+                        conn.execute("BEGIN")
+                        _update_task(task_id, progress=i,
+                                     message=f"Importing… {i}/{total}")
+                conn.commit()
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+        summary = (f"inserted={inserted}, updated={updated}, "
+                   f"skipped_existing={skipped_existing}, "
+                   f"skipped_blank={skipped_blank}, "
+                   f"dups_in_file={dups_in_file}")
+        _update_task(task_id, status="done", stage="done",
+                     progress=total,
+                     message="Import done. " + summary,
+                     cases_inserted=inserted,
+                     cases_updated=updated,
+                     cases_skipped_existing=skipped_existing,
+                     cases_skipped_blank=skipped_blank,
+                     cases_dups_in_file=dups_in_file)
+    except Exception as e:
+        traceback.print_exc()
+        _update_task(task_id, status="error", stage="error",
+                     error=f"{e.__class__.__name__}: {e}",
+                     message=f"Import failed: {e}")
+    finally:
+        try: os.remove(stash_path)
+        except OSError: pass
+
+
+@app.route("/api/cases/import/commit", methods=["POST"])
+def api_cases_import_commit():
+    payload = request.get_json() or {}
+    token = (payload.get("token") or "").strip()
+    policy = (payload.get("policy") or "skip").strip().lower()
+    if policy not in ("skip", "overwrite"):
+        return jsonify(error="policy must be 'skip' or 'overwrite'"), 400
+    if not _CASES_TOKEN_RE.fullmatch(token):
+        return jsonify(error="invalid token"), 400
+    stash_path = os.path.join(CASES_IMPORTS_DIR, f"{token}.xlsx")
+    if not os.path.exists(stash_path):
+        return jsonify(error="import session expired — re-upload."), 400
+    task_id = _new_task()
+    threading.Thread(
+        target=_cases_import_worker,
+        args=(task_id, stash_path, policy),
+        daemon=True,
+    ).start()
+    return jsonify(task_id=task_id)
+
+
+@app.route("/api/cases/search", methods=["GET", "POST"])
+def api_cases_search():
+    """Paginated listing. Three input modes on the same endpoint:
+    - empty `q` → full listing
+    - single-token `q` → prefix LIKE on the indexed column (fast)
+    - multi-token `q` (comma / whitespace / newline-separated) →
+      exact-match IN via a TEMP table join (bypasses the 999-bind cap)
+
+    POST with JSON `{field, q, page, limit}` is accepted for inputs
+    too long to fit in a URL (an Excel column of 20 k CNICs pasted
+    into the search box)."""
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or {}
+        field = (payload.get("field") or "cnic").strip().lower()
+        q_raw = payload.get("q") or ""
+        try:
+            page = max(1, int(payload.get("page") or 1))
+            limit = min(500, max(1, int(payload.get("limit") or 100)))
+        except (TypeError, ValueError):
+            return jsonify(error="bad page/limit"), 400
+    else:
+        field = (request.args.get("field") or "cnic").strip().lower()
+        q_raw = request.args.get("q") or ""
+        try:
+            page = max(1, int(request.args.get("page") or 1))
+            limit = min(500, max(1, int(request.args.get("limit") or 100)))
+        except ValueError:
+            return jsonify(error="bad page/limit"), 400
+    if field not in ("cnic", "name", "phone"):
+        return jsonify(error="field must be cnic / name / phone"), 400
+
+    values = _parse_multi_values(q_raw)
+    offset = (page - 1) * limit
+
+    with sqlite3.connect(CASES_DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        if not values:
+            total = conn.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
+            rows = conn.execute(
+                "SELECT order_id, cnic, name, original_name, phone, created_at "
+                "FROM cases ORDER BY order_id LIMIT ? OFFSET ?",
+                (limit, offset)).fetchall()
+            mode = "all"
+        elif len(values) == 1:
+            v = values[0]
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM cases WHERE {field} LIKE ?",
+                (v + "%",)).fetchone()[0]
+            rows = conn.execute(
+                f"SELECT order_id, cnic, name, original_name, phone, created_at "
+                f"FROM cases WHERE {field} LIKE ? "
+                f"ORDER BY order_id LIMIT ? OFFSET ?",
+                (v + "%", limit, offset)).fetchall()
+            mode = "prefix"
+        else:
+            _cases_temp_values_table(conn, values)
+            total = conn.execute(
+                f"SELECT COUNT(DISTINCT c.order_id) FROM cases c "
+                f"JOIN _srch_q q ON c.{field} = q.v").fetchone()[0]
+            rows = conn.execute(
+                f"SELECT DISTINCT c.order_id, c.cnic, c.name, "
+                f"c.original_name, c.phone, c.created_at FROM cases c "
+                f"JOIN _srch_q q ON c.{field} = q.v "
+                f"ORDER BY c.order_id LIMIT ? OFFSET ?",
+                (limit, offset)).fetchall()
+            mode = "exact"
+    return jsonify(
+        total=total, page=page, limit=limit,
+        mode=mode, values_parsed=len(values),
+        rows=[dict(r) for r in rows],
+    )
+
+
+@app.route("/api/cases/search/ids", methods=["GET", "POST"])
+def api_cases_search_ids():
+    """Return every order_id matching the filter, for 'select all
+    matching' in the UI. Same three modes as /api/cases/search.
+    Capped so the client can't force a multi-million-id payload;
+    narrow the filter or paginate if you need the rest."""
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or {}
+        field = (payload.get("field") or "cnic").strip().lower()
+        q_raw = payload.get("q") or ""
+        try:
+            cap = min(100_000, max(1, int(payload.get("cap") or 50_000)))
+        except (TypeError, ValueError):
+            return jsonify(error="bad cap"), 400
+    else:
+        field = (request.args.get("field") or "cnic").strip().lower()
+        q_raw = request.args.get("q") or ""
+        try:
+            cap = min(100_000, max(1, int(request.args.get("cap") or 50_000)))
+        except ValueError:
+            return jsonify(error="bad cap"), 400
+    if field not in ("cnic", "name", "phone"):
+        return jsonify(error="field must be cnic / name / phone"), 400
+
+    values = _parse_multi_values(q_raw)
+    with sqlite3.connect(CASES_DB_PATH) as conn:
+        if not values:
+            total = conn.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
+            rows = conn.execute(
+                "SELECT order_id FROM cases ORDER BY order_id LIMIT ?",
+                (cap,)).fetchall()
+        elif len(values) == 1:
+            v = values[0]
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM cases WHERE {field} LIKE ?",
+                (v + "%",)).fetchone()[0]
+            rows = conn.execute(
+                f"SELECT order_id FROM cases WHERE {field} LIKE ? "
+                f"ORDER BY order_id LIMIT ?", (v + "%", cap)).fetchall()
+        else:
+            _cases_temp_values_table(conn, values)
+            total = conn.execute(
+                f"SELECT COUNT(DISTINCT c.order_id) FROM cases c "
+                f"JOIN _srch_q q ON c.{field} = q.v").fetchone()[0]
+            rows = conn.execute(
+                f"SELECT DISTINCT c.order_id FROM cases c "
+                f"JOIN _srch_q q ON c.{field} = q.v "
+                f"ORDER BY c.order_id LIMIT ?", (cap,)).fetchall()
+    return jsonify(total=total, returned=len(rows),
+                   capped=(total > len(rows)),
+                   ids=[r[0] for r in rows])
+
+
+@app.route("/api/cases/by_ids", methods=["POST"])
+def api_cases_by_ids():
+    """Fetch display metadata (order_id / name / cnic / phone) for a
+    list of order_ids. Feeds the "Selected cases" panel so rows added
+    via 'select all matching' or bulk-match (which don't flow through
+    the paginated table) still render name / cnic / phone."""
+    payload = request.get_json(silent=True) or {}
+    raw = payload.get("order_ids") or []
+    if not isinstance(raw, list) or not raw:
+        return jsonify(rows=[])
+    ids = []
+    seen = set()
+    for x in raw:
+        s = str(x).strip()
+        if s and s not in seen:
+            seen.add(s)
+            ids.append(s)
+        if len(ids) >= 50_000:
+            break
+    out = []
+    with sqlite3.connect(CASES_DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            qs = ",".join("?" * len(chunk))
+            for r in conn.execute(
+                    f"SELECT order_id, name, original_name, cnic, phone "
+                    f"FROM cases WHERE order_id IN ({qs})",
+                    tuple(chunk)):
+                out.append(dict(r))
+    return jsonify(rows=out)
+
+
+@app.route("/api/cases/update_name", methods=["POST"])
+def api_cases_update_name():
+    """Inline-edit the `name` of a single case from the search-result
+    table. Updates BOTH the indexed `cases.name` column (so future
+    searches/bulk_match find the corrected spelling) AND the `name`
+    key inside `row_json` (so the render pipeline pulls the new
+    value at generate time). Other fields are untouched.
+
+    Body JSON: { order_id, name }"""
+    payload = request.get_json(silent=True) or {}
+    oid = str(payload.get("order_id") or "").strip()
+    new_name = str(payload.get("name") or "").strip()
+    if not oid:
+        return jsonify(error="order_id required"), 400
+    if len(new_name) > 200:
+        return jsonify(error="name too long (max 200 chars)"), 400
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    with _CASES_LOCK, sqlite3.connect(CASES_DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT row_json FROM cases WHERE order_id = ?",
+            (oid,)).fetchone()
+        if row is None:
+            return jsonify(error="not found"), 404
+        try:
+            data = json.loads(row["row_json"])
+        except ValueError:
+            data = {}
+        data["name"] = new_name
+        conn.execute(
+            "UPDATE cases SET name = ?, row_json = ?, updated_at = ? "
+            "WHERE order_id = ?",
+            (new_name, json.dumps(data, ensure_ascii=False), now, oid))
+        conn.commit()
+    return jsonify(ok=True, order_id=oid, name=new_name, updated_at=now)
+
+
+@app.route("/api/cases/bulk_match", methods=["POST"])
+def api_cases_bulk_match():
+    """Bulk-match an explicit list of cnic / name / phone values and
+    return the order_ids that exist in the inventory — the "upload a
+    spreadsheet of CNICs and pick the ones we have" case.
+
+    Two input shapes share this endpoint:
+
+    - multipart/form-data: { field, excel: <file> }
+        The Excel's first header row is scanned for a column matching
+        the chosen field (via CASE_COL_ALIASES); if none match, the
+        first column is used. Every cell in that column becomes a
+        match value. Caps at 100 k values.
+
+    - application/json: { field, values: [...] }
+        For typed / pasted input that's too long to fit the search
+        box. Same 100 k cap.
+
+    Response: { field, total_values, matched_count, missing_count,
+                missing_sample:[...], matched_ids:[...],
+                matched_meta:[{order_id,name,cnic,phone}, ...up to 200] }
+    `matched_meta` lets the client show a preview table without a
+    follow-up /by_ids round-trip; pull /by_ids if it needs more.
+    """
+    field = None
+    values = []
+    src_col = None
+    is_mp = (request.content_type or "").startswith("multipart/form-data")
+    if is_mp:
+        field = (request.form.get("field") or "cnic").strip().lower()
+        excel = request.files.get("excel")
+        if not excel:
+            return jsonify(error="excel file required"), 400
+        stash = os.path.join(CASES_IMPORTS_DIR,
+                             f"bulk_{uuid.uuid4().hex}.xlsx")
+        excel.save(stash)
+        try:
+            wb = openpyxl.load_workbook(stash, read_only=True,
+                                        data_only=True)
+            ws = wb.active
+            rows_iter = ws.iter_rows(values_only=True)
+            try:
+                header_row = next(rows_iter)
+            except StopIteration:
+                return jsonify(error="empty excel"), 400
+            headers = [str(h).strip() if h is not None else ""
+                       for h in header_row]
+            aliases = CASE_COL_ALIASES.get(field, ())
+            match = _find_col(headers, aliases)
+            col_idx = headers.index(match) if match else 0
+            src_col = match or (headers[0] if headers else "")
+            seen = set()
+            for row in rows_iter:
+                if col_idx >= len(row):
+                    continue
+                v = row[col_idx]
+                if v is None:
+                    continue
+                if isinstance(v, float) and v.is_integer():
+                    v = int(v)
+                s = str(v).strip()
+                if s and s not in seen:
+                    seen.add(s)
+                    values.append(s)
+                    if len(values) >= 100_000:
+                        break
+            wb.close()
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify(error=f"excel read failed: {e}"), 400
+        finally:
+            try: os.remove(stash)
+            except OSError: pass
+    else:
+        payload = request.get_json(silent=True) or {}
+        field = (payload.get("field") or "cnic").strip().lower()
+        raw = payload.get("values") or []
+        if not isinstance(raw, list):
+            return jsonify(error="values must be a list"), 400
+        seen = set()
+        for v in raw:
+            if v is None:
+                continue
+            s = str(v).strip()
+            if s and s not in seen:
+                seen.add(s)
+                values.append(s)
+                if len(values) >= 100_000:
+                    break
+
+    if field not in ("cnic", "name", "phone"):
+        return jsonify(error="field must be cnic / name / phone"), 400
+    if not values:
+        return jsonify(error="no values to match"), 400
+
+    matched_ids = []
+    matched_meta = []
+    matched_value_set = set()
+    with sqlite3.connect(CASES_DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        _cases_temp_values_table(conn, values)
+        for r in conn.execute(
+                f"SELECT c.order_id, c.name, c.original_name, c.cnic, "
+                f"c.phone, c.{field} AS matched_v "
+                f"FROM cases c JOIN _srch_q q ON c.{field} = q.v "
+                f"ORDER BY c.order_id"):
+            matched_ids.append(r["order_id"])
+            matched_value_set.add(r["matched_v"])
+            if len(matched_meta) < 200:
+                matched_meta.append({
+                    "order_id": r["order_id"], "name": r["name"],
+                    "original_name": r["original_name"],
+                    "cnic": r["cnic"], "phone": r["phone"],
+                })
+    missing = [v for v in values if v not in matched_value_set]
+    return jsonify(
+        field=field,
+        total_values=len(values),
+        matched_count=len(matched_ids),
+        missing_count=len(missing),
+        missing_sample=missing[:200],
+        matched_ids=matched_ids,
+        matched_meta=matched_meta,
+        source_column=src_col,
+    )
+
+
+@app.route("/api/cases/delete", methods=["POST"])
+def api_cases_delete():
+    """Delete by order_ids, or `all=true` to wipe the store.
+    Kept minimal — the UI exposes this as a tiny safety-wrapped button
+    so a misclick on a 400 k-row import is still recoverable (user
+    re-uploads)."""
+    payload = request.get_json() or {}
+    if payload.get("all") is True:
+        with _CASES_LOCK, sqlite3.connect(CASES_DB_PATH) as conn:
+            conn.execute("DELETE FROM cases")
+            conn.commit()
+        return jsonify(ok=True, deleted="all")
+    ids = payload.get("order_ids") or []
+    if not isinstance(ids, list) or not ids:
+        return jsonify(error="order_ids must be a non-empty list "
+                             "(or pass {\"all\": true})"), 400
+    ids = [str(x).strip() for x in ids if str(x).strip()]
+    deleted = 0
+    with _CASES_LOCK, sqlite3.connect(CASES_DB_PATH) as conn:
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            qs = ",".join("?" * len(chunk))
+            cur = conn.execute(
+                f"DELETE FROM cases WHERE order_id IN ({qs})",
+                tuple(chunk))
+            deleted += cur.rowcount
+        conn.commit()
+    return jsonify(ok=True, deleted=deleted)
+
+
+@app.route("/api/cases/generate", methods=["POST"])
+def api_cases_generate():
+    """Kick off a batch render for the currently-selected order_ids.
+    Body JSON: {
+      template_slug, order_ids:[...],
+      date_value?:YYYY-MM-DD (default today),
+      manual_fields?:{}, filename_fields?:[...],
+      group_by_field?:str, machine?:vps|mac }
+    Returns {task_id} — client reuses /status and /download."""
+    payload = request.get_json() or {}
+    template_slug = (payload.get("template_slug") or "default").strip()
+    if not _valid_slug(template_slug):
+        return jsonify(error="invalid template_slug"), 400
+    template = load_template(template_slug)
+    if template is None:
+        return jsonify(error=f"Template '{template_slug}' not found."), 400
+
+    raw_ids = payload.get("order_ids") or []
+    if not isinstance(raw_ids, list) or not raw_ids:
+        return jsonify(error="No order_ids selected."), 400
+    if len(raw_ids) > 50_000:
+        return jsonify(error="Too many order_ids (max 50,000 per batch)."), 400
+    # Coerce + dedupe while preserving user's selection order.
+    seen, order_ids = set(), []
+    for oid in raw_ids:
+        s = str(oid).strip()
+        if s and s not in seen:
+            seen.add(s)
+            order_ids.append(s)
+
+    data_rows, missing = _cases_fetch_rows(order_ids)
+    if missing:
+        return jsonify(
+            error=f"{len(missing)} order_id(s) not found in inventory",
+            sample=missing[:10]), 400
+    if not data_rows:
+        return jsonify(error="No matching rows."), 400
+
+    # Date override. Inventory mode's whole point is "use today's date by
+    # default"; empty means today, explicit ISO overrides.
+    date_str = (payload.get("date_value") or "").strip()
+    try:
+        d = (datetime.date.fromisoformat(date_str) if date_str
+             else datetime.date.today())
+    except ValueError:
+        return jsonify(error="date_value must be YYYY-MM-DD"), 400
+    formatted_date = d.strftime("%d/%m/%Y")
+    for r in data_rows:
+        r["date"] = formatted_date
+
+    manual_fields   = payload.get("manual_fields") or {}
+    filename_fields = payload.get("filename_fields") or ["name"]
+    # Inventory mode's standard output shape is "one zip per 负责人,
+    # all bundled into a dated batch zip". Caller can override with an
+    # explicit column name or pass "__none__" to skip grouping.
+    group_by_field  = payload.get("group_by_field")
+    if group_by_field is None or group_by_field == "":
+        group_by_field = "负责人"
+    elif group_by_field == "__none__":
+        group_by_field = None
+    profile         = _get_machine_profile(payload.get("machine"))
+
+    task_id = _new_task()
+
+    def worker():
+        try:
+            generate_notices_html(
+                template, data_rows,
+                manual_fields=manual_fields,
+                filename_fields=filename_fields,
+                group_by_field=group_by_field,
+                task_id=task_id,
+                render_workers=profile["render_workers"],
+                profile_label=profile["label"],
+            )
+            # Bundle per-group zips into one dated batch zip so the user
+            # downloads a single file instead of N per-group links.
+            _wrap_inventory_batch(task_id)
+        except Exception as e:
+            traceback.print_exc()
+            _update_task(task_id, status="error", stage="error",
+                         error=f"{e.__class__.__name__}: {e}",
+                         message=f"Generation failed: {e}")
+
+    threading.Thread(target=worker, daemon=True).start()
+    return jsonify(task_id=task_id, row_count=len(data_rows))
+
+
 @app.route("/generate_one", methods=["POST"])
 def generate_one():
     """Render ONE notice from user-typed field values and stream the
@@ -2887,6 +3853,8 @@ HTML_TEMPLATE = r"""
   <span class="name">S&amp;S LAW FIRM</span>
   <span class="sub">Legal Notice Workstation</span>
   <span class="spacer"></span>
+  <a href="/inventory" style="margin-right:10px;">📦 Inventory</a>
+  <a href="/verify" style="margin-right:10px;">🔍 Verify</a>
   <a href="/logout">Sign Out</a>
 </header>
 
@@ -3977,6 +4945,1094 @@ loadHistory(0);
 """
 
 
+INVENTORY_TEMPLATE = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inventory — S&amp;S Law Firm</title>
+<link rel="icon" type="image/png" href="__LOGO_DATA_URI__">
+<style>
+  :root { --primary:#0b1220; --accent:#c9a14a; --bg:#f4f1ea;
+          --panel:#fff; --border:#e0dcd2; --ok:#16a34a; --err:#dc2626;
+          --muted:#6b7280; }
+  * { box-sizing: border-box; margin:0; padding:0; }
+  body { font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC",sans-serif;
+         background:var(--bg); color:#111; padding:20px; }
+  .wrap { max-width:1200px; margin:0 auto; padding-bottom:120px; }
+  header { display:flex; align-items:center; gap:14px; margin-bottom:18px; }
+  header img { width:44px; height:44px; border-radius:50%; }
+  header h1 { font-size:1.2rem; font-weight:700; color:var(--primary); }
+  header .sub { color:#666; font-size:.8rem; }
+  header nav { margin-left:auto; display:flex; gap:8px; }
+  header nav a { color:#555; text-decoration:none; font-size:.85rem;
+                 padding:6px 12px; border:1px solid var(--border);
+                 border-radius:5px; background:#fff; }
+  header nav a:hover { background:#eee; }
+
+  .card { background:var(--panel); border:1px solid var(--border);
+          border-radius:8px; padding:18px 20px; margin-bottom:16px; }
+  .card h2 { font-size:.85rem; font-weight:700; color:var(--primary);
+             text-transform:uppercase; letter-spacing:.08em;
+             border-bottom:2px solid var(--accent); padding-bottom:7px;
+             margin-bottom:14px; display:flex; align-items:center; gap:8px; }
+  .card h2 .count { margin-left:auto; color:var(--muted);
+                    font-size:.72rem; font-weight:500;
+                    letter-spacing:.02em; text-transform:none; }
+
+  .btn { padding:8px 16px; border:1px solid var(--border); background:#fff;
+         border-radius:5px; cursor:pointer; font-size:.85rem; color:#333; }
+  .btn:hover:not(:disabled) { background:#f0ede5; }
+  .btn:disabled { opacity:.45; cursor:not-allowed; }
+  .btn-primary { background:var(--primary); color:#fff; border-color:var(--primary); }
+  .btn-primary:hover:not(:disabled) { background:#1a2541; }
+  .btn-accent { background:var(--accent); color:#0b1220; border-color:#b08b39;
+                font-weight:600; }
+  .btn-accent:hover:not(:disabled) { background:#d4af5f; }
+  .btn-danger { color:#7f1d1d; border-color:#f3b7b7; background:#fdecec; }
+  .btn-danger:hover:not(:disabled) { background:#fbd8d8; }
+  .btn-sm { padding:4px 10px; font-size:.78rem; }
+
+  input[type=text], input[type=date], input[type=number], select {
+    padding:7px 10px; border:1px solid var(--border); border-radius:5px;
+    background:#fff; font-size:.88rem; color:#111;
+  }
+  input[type=file] { font-size:.85rem; }
+
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .grow { flex:1; min-width:160px; }
+
+  .import-summary { display:grid; grid-template-columns:repeat(4, 1fr);
+                    gap:10px; margin-top:12px; }
+  .stat { background:#faf8f3; border:1px solid var(--border);
+          border-radius:6px; padding:10px 12px; }
+  .stat .k { font-size:.68rem; text-transform:uppercase; color:var(--muted);
+             letter-spacing:.08em; }
+  .stat .v { font-size:1.3rem; font-weight:700; color:var(--primary);
+             margin-top:3px; font-variant-numeric:tabular-nums; }
+  .stat.warn { background:#fff8e6; border-color:#f5d58c; }
+  .stat.warn .v { color:#8b6914; }
+
+  .policy-row { display:flex; gap:18px; align-items:center;
+                margin-top:14px; padding:12px 14px;
+                background:#faf8f3; border-radius:6px;
+                border:1px solid var(--border); }
+  .policy-row label { display:flex; align-items:center; gap:6px;
+                      font-size:.88rem; cursor:pointer; }
+
+  .progress { margin-top:10px; height:8px; background:#eee;
+              border-radius:4px; overflow:hidden; }
+  .progress-bar { height:100%; background:var(--accent); width:0%;
+                  transition:width .25s; }
+  .progress-msg { font-size:.78rem; color:#555; margin-top:6px; }
+  .progress-msg.err { color:var(--err); }
+  .progress-msg.ok { color:var(--ok); }
+
+  table.data { width:100%; border-collapse:collapse; font-size:.84rem;
+               margin-top:8px; }
+  table.data th { text-align:left; padding:8px 10px; background:#f8f6f0;
+                  color:#555; font-weight:600; font-size:.72rem;
+                  text-transform:uppercase; letter-spacing:.06em;
+                  border-bottom:2px solid var(--border); }
+  table.data td { padding:7px 10px; border-bottom:1px solid #f0ede5;
+                  vertical-align:middle; }
+  table.data tr:hover td { background:#faf8f3; }
+  table.data td.mono { font-family:ui-monospace,"SF Mono",monospace;
+                       font-size:.78rem; letter-spacing:.2pt; }
+  table.data .check { width:30px; text-align:center; }
+  table.data tr.selected td { background:#fffbe8; }
+
+  .pager { margin-top:10px; display:flex; justify-content:space-between;
+           align-items:center; font-size:.8rem; color:#666; }
+  .pager .group { display:flex; gap:6px; align-items:center; }
+  .muted { color:var(--muted); font-style:italic; }
+
+  /* Sticky bottom action bar */
+  .action-bar { position:fixed; bottom:0; left:0; right:0;
+                background:rgba(11,18,32,.98); color:#fff;
+                padding:12px 24px; display:flex; gap:14px;
+                align-items:center; box-shadow:0 -4px 18px rgba(0,0,0,.2);
+                z-index:50; }
+  .action-bar .selcount { font-size:.95rem; font-weight:600; }
+  .action-bar .selcount .n { color:var(--accent); font-size:1.1rem;
+                             margin:0 4px; }
+  .action-bar .spacer { flex:1; }
+  .action-bar input, .action-bar select {
+    background:rgba(255,255,255,.12); color:#fff;
+    border-color:rgba(255,255,255,.2);
+  }
+  .action-bar input::placeholder { color:rgba(255,255,255,.5); }
+  .action-bar label { font-size:.78rem; color:#cbd5e1; }
+
+  .downloads { margin-top:10px; display:flex; flex-wrap:wrap; gap:6px; }
+  .downloads a { display:inline-block; padding:5px 12px;
+                 background:#eaf7ee; border:1px solid #b9e1c3;
+                 color:#14532d; border-radius:4px; font-size:.82rem;
+                 text-decoration:none; }
+  .downloads a:hover { background:#d6f0dd; }
+
+  .conflicts-sample { font-family:ui-monospace,monospace; font-size:.78rem;
+                      color:#7f1d1d; background:#fdecec; padding:8px 10px;
+                      border-radius:5px; margin-top:8px;
+                      max-height:120px; overflow-y:auto; }
+  .conflicts-sample code { display:inline-block; margin-right:6px; }
+
+  .hidden { display:none !important; }
+
+  details.advanced summary { cursor:pointer; font-size:.82rem;
+                             color:var(--muted); margin-top:8px; }
+  details.advanced[open] summary { margin-bottom:8px; }
+
+  /* Search card additions */
+  .search-hint { font-size:.75rem; color:var(--muted);
+                 margin-top:6px; padding-left:2px; }
+  details.bulk-box { margin-top:12px; border:1px dashed var(--border);
+                     border-radius:6px; padding:8px 12px;
+                     background:#fbfaf5; }
+  details.bulk-box summary { cursor:pointer; font-size:.85rem;
+                             color:var(--primary); font-weight:600;
+                             padding:4px 2px; }
+  details.bulk-box[open] summary { margin-bottom:6px; }
+  .bulk-body { padding:6px 2px 4px; }
+  .bulk-body .bulk-lbl { display:block; font-size:.74rem;
+                         color:#555; margin-bottom:4px;
+                         text-transform:uppercase; letter-spacing:.06em; }
+  .bulk-body textarea { width:100%; padding:8px 10px; resize:vertical;
+                        border:1px solid var(--border); border-radius:5px;
+                        background:#fff; font-size:.82rem;
+                        font-family:ui-monospace,"SF Mono",monospace; }
+  .bulk-body .bulk-muted { font-size:.72rem; color:var(--muted);
+                           margin-top:4px; line-height:1.35; }
+  .bulk-status { font-size:.82rem; color:var(--muted); }
+  .bulk-status.ok  { color:var(--ok); }
+  .bulk-status.err { color:var(--err); }
+  .bulk-missing { margin-top:10px; padding:10px 12px;
+                  background:#fff8e6; border:1px solid #f5d58c;
+                  border-radius:5px; font-size:.78rem;
+                  line-height:1.5; color:#8b6914; }
+  .bulk-missing .ids { font-family:ui-monospace,monospace;
+                       font-size:.74rem; max-height:120px;
+                       overflow-y:auto; display:block;
+                       margin-top:6px; word-break:break-all; }
+
+  /* Selected card */
+  .selected-scroll { max-height:420px; overflow-y:auto;
+                     border:1px solid var(--border); border-radius:5px; }
+  .selected-scroll table { margin-top:0; }
+  .selected-scroll thead th { position:sticky; top:0; z-index:1; }
+  #selectedTable td.del { text-align:center; }
+  #selectedTable td.del button {
+    border:none; background:transparent; cursor:pointer;
+    font-size:.9rem; color:var(--muted); padding:2px 6px;
+    border-radius:3px;
+  }
+  #selectedTable td.del button:hover {
+    background:#fdecec; color:var(--err);
+  }
+
+  /* Inline-editable name cell in search results */
+  td.name-cell { padding:6px 10px; transition:background .25s; }
+  td.name-cell .name-edit {
+    cursor:text; padding:2px 6px; border-radius:3px;
+    transition:background .15s, outline .15s; min-height:1.2em;
+    display:inline-block;
+  }
+  td.name-cell .name-edit:hover { background:#fcf8e8; }
+  td.name-cell .name-edit:focus { outline:2px solid var(--accent);
+                                  outline-offset:-2px;
+                                  background:#fffbe8; }
+  td.name-cell .name-edit::after { content:"✎"; color:var(--muted);
+                                   margin-left:6px; font-size:.75em;
+                                   opacity:0; }
+  tr:hover td.name-cell .name-edit::after { opacity:.5; }
+  td.name-cell .name-edit:focus::after { opacity:0; }
+  td.name-cell.saving  .name-edit { background:#fff8e6; }
+  td.name-cell.saved   .name-edit { background:#eaf7ee; }
+  td.name-cell.save-err .name-edit { background:#fdecec; color:var(--err); }
+  .name-orig-hint { display:none; font-size:.7rem; color:var(--muted);
+                    font-style:italic; margin-top:2px; line-height:1.3; }
+  td.name-cell.edited .name-orig-hint { display:block; }
+  td.name-cell.edited .name-edit { border-bottom:1.5px dotted var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <img src="__LOGO_DATA_URI__" alt="logo">
+    <div>
+      <h1>Inventory Mode</h1>
+      <div class="sub">Import cases once · select · generate on demand</div>
+    </div>
+    <nav>
+      <a href="/">← Workstation</a>
+      <a href="/verify">🔍 Verify</a>
+      <a href="/logout">Sign Out</a>
+    </nav>
+  </header>
+
+  <!-- ═══ 1 · IMPORT ═══ -->
+  <div class="card">
+    <h2>📥 Import Case Excel
+      <span class="count" id="totalCount">—</span>
+    </h2>
+    <div class="row">
+      <input type="file" id="excelFile" accept=".xlsx">
+      <button class="btn btn-primary" id="previewBtn">Preview Import</button>
+      <span class="spacer grow"></span>
+      <button class="btn btn-danger btn-sm" id="wipeBtn">Clear Inventory</button>
+    </div>
+
+    <!-- Preview result (shown after /preview returns) -->
+    <div id="previewBox" class="hidden" style="margin-top:14px;">
+      <div class="import-summary">
+        <div class="stat">
+          <div class="k">Rows in file</div>
+          <div class="v" id="pvTotal">0</div>
+        </div>
+        <div class="stat">
+          <div class="k">New (will insert)</div>
+          <div class="v" id="pvNew">0</div>
+        </div>
+        <div class="stat warn">
+          <div class="k">Conflicts (order_id exists)</div>
+          <div class="v" id="pvConflict">0</div>
+        </div>
+        <div class="stat warn">
+          <div class="k">Dup within file</div>
+          <div class="v" id="pvDupFile">0</div>
+        </div>
+      </div>
+      <div id="pvDetected" class="muted" style="margin-top:8px; font-size:.8rem;"></div>
+      <div id="pvConflictSample" class="conflicts-sample hidden"></div>
+
+      <div class="policy-row" id="policyRow">
+        <strong style="font-size:.85rem;">If order_id conflicts:</strong>
+        <label><input type="radio" name="policy" value="skip" checked>
+               Skip (keep existing)</label>
+        <label><input type="radio" name="policy" value="overwrite">
+               Overwrite with new row</label>
+        <span class="spacer grow"></span>
+        <button class="btn btn-accent" id="commitBtn">Commit Import</button>
+      </div>
+
+      <div id="importProgressBox" class="hidden" style="margin-top:12px;">
+        <div class="progress"><div class="progress-bar" id="importBar"></div></div>
+        <div class="progress-msg" id="importMsg">…</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ 2 · SEARCH ═══ -->
+  <div class="card">
+    <h2>🔍 Search &amp; Select
+      <span class="count" id="searchModeBadge"></span>
+    </h2>
+    <div class="row">
+      <label style="font-size:.82rem; color:#555;">Field</label>
+      <select id="searchField">
+        <option value="cnic">CNIC</option>
+        <option value="name">Name</option>
+        <option value="phone">Phone</option>
+      </select>
+      <input type="text" id="searchQ" class="grow"
+             placeholder="single prefix (e.g. '42301')  OR  many values separated by comma / space / newline">
+      <button class="btn btn-primary" id="searchBtn">Search</button>
+      <span class="spacer grow"></span>
+      <button class="btn btn-sm" id="selectPageBtn">Select this page</button>
+      <button class="btn btn-sm" id="selectAllBtn">Select all matching</button>
+    </div>
+    <div class="search-hint">
+      One value → prefix match · Many values → exact match (paste a list of CNICs / phones)
+    </div>
+
+    <!-- Bulk select via textarea or Excel file upload -->
+    <details class="bulk-box">
+      <summary>📎 Bulk select from file or big paste</summary>
+      <div class="bulk-body">
+        <div class="row" style="align-items:flex-start;">
+          <div class="grow" style="min-width:280px;">
+            <label class="bulk-lbl">Paste values (one per line, or comma/space separated)</label>
+            <textarea id="bulkText" rows="4"
+              placeholder="4230113751365&#10;4420551500363&#10;4220169696965&#10;&#10;(uses the Field selector above)"></textarea>
+          </div>
+          <div style="min-width:220px;">
+            <label class="bulk-lbl">…or upload an Excel</label>
+            <input type="file" id="bulkFile" accept=".xlsx">
+            <div class="bulk-muted">
+              Looks for a column matching the chosen Field; falls back
+              to the first column.
+            </div>
+          </div>
+        </div>
+        <div class="row" style="margin-top:10px;">
+          <button class="btn btn-accent" id="bulkMatchBtn">Match &amp; add to selection</button>
+          <span class="bulk-status" id="bulkStatus"></span>
+        </div>
+        <div class="bulk-missing hidden" id="bulkMissing"></div>
+      </div>
+    </details>
+
+    <table class="data" id="resultTable">
+      <thead>
+        <tr>
+          <th class="check"><input type="checkbox" id="headerCheck"
+                                   title="Toggle this page"></th>
+          <th>Order ID</th>
+          <th>Name</th>
+          <th>CNIC</th>
+          <th>Phone</th>
+          <th>Imported</th>
+        </tr>
+      </thead>
+      <tbody id="resultBody">
+        <tr><td colspan="6" class="muted">Import an Excel above, then search.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="pager">
+      <div id="pagerInfo">—</div>
+      <div class="group">
+        <button class="btn btn-sm" id="prevPage">← Prev</button>
+        <span id="pageLabel">1</span>
+        <button class="btn btn-sm" id="nextPage">Next →</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ 2.5 · SELECTED CASES ═══ -->
+  <div class="card" id="selectedCard">
+    <h2>🧺 Selected Cases
+      <span class="count" id="selectedSummary">0 selected</span>
+    </h2>
+    <div class="row" style="margin-bottom:8px;">
+      <button class="btn btn-sm" id="selClearBtn2">Clear all</button>
+      <button class="btn btn-sm" id="selDedupeNameBtn" title="Keep one row per name">
+        Dedupe by name
+      </button>
+      <button class="btn btn-sm" id="selDedupeCnicBtn" title="Keep one row per CNIC">
+        Dedupe by CNIC
+      </button>
+      <span class="spacer grow"></span>
+      <span class="muted" id="selTruncateNote"></span>
+    </div>
+    <div class="selected-scroll">
+      <table class="data" id="selectedTable">
+        <thead>
+          <tr>
+            <th style="width:34px;"></th>
+            <th>Order ID</th>
+            <th>Name</th>
+            <th>CNIC</th>
+            <th>Phone</th>
+          </tr>
+        </thead>
+        <tbody id="selectedBody">
+          <tr><td colspan="5" class="muted">Nothing selected yet.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ═══ 3 · GENERATE ═══ -->
+  <div class="card">
+    <h2>📝 Generate Notices</h2>
+    <div class="row">
+      <label style="font-size:.82rem; color:#555;">Template</label>
+      <select id="tplSelect" class="grow" style="max-width:260px;"></select>
+
+      <label style="font-size:.82rem; color:#555;">Date</label>
+      <input type="date" id="dateInput">
+
+      <label style="font-size:.82rem; color:#555;">Profile</label>
+      <select id="profileSelect">
+        <option value="vps">VPS (conservative)</option>
+        <option value="mac">Mac (max)</option>
+      </select>
+    </div>
+
+    <details class="advanced">
+      <summary>Advanced</summary>
+      <div class="row" style="margin-top:6px;">
+        <label style="font-size:.82rem; color:#555;">Filename fields</label>
+        <input type="text" id="fnFields" class="grow"
+               placeholder="comma-separated, e.g. name,cnic"
+               value="name,cnic">
+        <label style="font-size:.82rem; color:#555;">Group by</label>
+        <input type="text" id="groupBy" placeholder="column (default: 负责人 · type __none__ to skip)">
+      </div>
+    </details>
+
+    <div id="genProgressBox" class="hidden" style="margin-top:14px;">
+      <div class="progress"><div class="progress-bar" id="genBar"></div></div>
+      <div class="progress-msg" id="genMsg">…</div>
+      <div class="downloads" id="genDownloads"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Sticky selection / action bar -->
+<div class="action-bar">
+  <div class="selcount">
+    <span class="n" id="selN">0</span> selected
+  </div>
+  <button class="btn btn-sm" id="clearSelBtn">Clear</button>
+  <span class="spacer"></span>
+  <button class="btn btn-accent" id="generateBtn" disabled>Generate Notices</button>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const H = s => String(s == null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+// Upper bound on rows rendered in the Selected panel — we keep the
+// authoritative Set small in memory but never DOM-render more than
+// this (huge <tbody>s pin the tab for seconds on older laptops).
+const MAX_SEL_DISPLAY = 2000;
+
+const state = {
+  selected: new Set(),              // order_id (the authoritative set)
+  meta:     new Map(),              // order_id → {order_id,name,cnic,phone}
+  search:   { field:'cnic', q:'', page:1, limit:100, total:0, mode:'all' },
+  lastRows: [],
+  importToken: null,
+  importTaskId: null,
+  genTaskId: null,
+};
+
+// ── Bootstrap ───────────────────────────────────────────────
+async function boot() {
+  await Promise.all([refreshCount(), loadTemplates()]);
+  $('dateInput').value = new Date().toISOString().slice(0,10);
+  renderSelectedPanel();
+}
+
+async function refreshCount() {
+  try {
+    const r = await fetch('/api/cases/stats');
+    const d = await r.json();
+    $('totalCount').textContent =
+      `${(d.count || 0).toLocaleString()} case(s) in inventory`;
+  } catch (e) { /* quiet */ }
+}
+
+async function loadTemplates() {
+  const r = await fetch('/api/templates');
+  const list = await r.json();
+  const sel = $('tplSelect');
+  sel.innerHTML = list.map(t =>
+    `<option value="${H(t.slug)}">${H(t.name)}${t.builtin?' (default)':''}</option>`
+  ).join('');
+}
+
+// ── IMPORT ──────────────────────────────────────────────────
+$('previewBtn').onclick = async () => {
+  const f = $('excelFile').files[0];
+  if (!f) { alert('Pick an Excel file first.'); return; }
+  const fd = new FormData();
+  fd.append('excel', f);
+  $('previewBtn').disabled = true;
+  $('previewBtn').textContent = 'Analyzing…';
+  try {
+    const r = await fetch('/api/cases/import/preview',
+                          { method:'POST', body: fd });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'preview failed');
+    state.importToken = d.token;
+    $('pvTotal').textContent    = (d.total || 0).toLocaleString();
+    $('pvNew').textContent      = (d.new_count || 0).toLocaleString();
+    $('pvConflict').textContent = (d.conflict_count || 0).toLocaleString();
+    $('pvDupFile').textContent  = (d.dup_in_file_count || 0).toLocaleString();
+    $('pvDetected').innerHTML = 'Detected columns — '
+      + `order_id: <code>${H(d.order_id_col)}</code>, `
+      + `name: <code>${H(d.name_col || '—')}</code>, `
+      + `cnic: <code>${H(d.cnic_col || '—')}</code>, `
+      + `phone: <code>${H(d.phone_col || '—')}</code>`;
+    const cs = $('pvConflictSample');
+    if ((d.conflicts_sample || []).length) {
+      cs.innerHTML = '<strong>Conflicting order_ids (first '
+        + d.conflicts_sample.length + '):</strong> '
+        + d.conflicts_sample.map(x => `<code>${H(x)}</code>`).join(' ');
+      cs.classList.remove('hidden');
+    } else { cs.classList.add('hidden'); }
+    // If no conflicts, the policy radio is moot — still show it for
+    // consistency, preselected to "skip" (which acts as a no-op).
+    $('previewBox').classList.remove('hidden');
+    $('importProgressBox').classList.add('hidden');
+  } catch (e) {
+    alert('Preview failed: ' + e.message);
+  } finally {
+    $('previewBtn').disabled = false;
+    $('previewBtn').textContent = 'Preview Import';
+  }
+};
+
+$('commitBtn').onclick = async () => {
+  if (!state.importToken) { alert('No pending import.'); return; }
+  const policy = document.querySelector('input[name=policy]:checked').value;
+  $('commitBtn').disabled = true;
+  try {
+    const r = await fetch('/api/cases/import/commit', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ token: state.importToken, policy }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'commit failed');
+    state.importTaskId = d.task_id;
+    $('importProgressBox').classList.remove('hidden');
+    pollImport();
+  } catch (e) {
+    alert('Commit failed: ' + e.message);
+    $('commitBtn').disabled = false;
+  }
+};
+
+async function pollImport() {
+  const tid = state.importTaskId;
+  if (!tid) return;
+  try {
+    const r = await fetch('/status/' + tid);
+    const d = await r.json();
+    const pct = d.total ? Math.round((d.progress / d.total) * 100) : 0;
+    $('importBar').style.width = pct + '%';
+    $('importMsg').textContent = d.message || d.stage || '';
+    $('importMsg').className = 'progress-msg';
+    if (d.status === 'done') {
+      $('importMsg').className = 'progress-msg ok';
+      $('commitBtn').disabled = false;
+      state.importToken = null;
+      await refreshCount();
+      return;
+    }
+    if (d.status === 'error') {
+      $('importMsg').className = 'progress-msg err';
+      $('importMsg').textContent = d.error || d.message || 'failed';
+      $('commitBtn').disabled = false;
+      return;
+    }
+    setTimeout(pollImport, 800);
+  } catch (e) {
+    $('importMsg').className = 'progress-msg err';
+    $('importMsg').textContent = 'Polling failed: ' + e.message;
+  }
+}
+
+$('wipeBtn').onclick = async () => {
+  if (!confirm('Delete ALL cases from inventory? '
+             + 'You will need to re-import. This cannot be undone.'))
+    return;
+  const r = await fetch('/api/cases/delete', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ all: true })
+  });
+  if (r.ok) {
+    state.selected.clear();
+    state.meta.clear();
+    state.lastRows = [];
+    $('resultBody').innerHTML =
+      '<tr><td colspan="6" class="muted">Inventory cleared.</td></tr>';
+    await refreshCount();
+    onSelectionChanged();
+  } else { alert('Delete failed.'); }
+};
+
+// ── SEARCH ──────────────────────────────────────────────────
+async function runSearch(page) {
+  state.search.field = $('searchField').value;
+  state.search.q     = $('searchQ').value.trim();
+  state.search.page  = Math.max(1, page || 1);
+  const body = {
+    field: state.search.field, q: state.search.q,
+    page: state.search.page, limit: state.search.limit,
+  };
+  let r;
+  // Multi-line / very-long paste → must go via POST (URL limit ~4 KB).
+  if (state.search.q.length > 3000) {
+    r = await fetch('/api/cases/search', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body),
+    });
+  } else {
+    const qs = new URLSearchParams({
+      field: body.field, page: body.page, limit: body.limit,
+    });
+    if (body.q) qs.set('q', body.q);
+    r = await fetch('/api/cases/search?' + qs.toString());
+  }
+  const d = await r.json();
+  if (!r.ok) { alert('Search failed: ' + (d.error||'?')); return; }
+  state.search.total = d.total;
+  state.search.mode  = d.mode || 'all';
+  state.lastRows = d.rows || [];
+  // Opportunistic meta enrichment — every row the user sees is cached
+  // so the Selected panel can draw without a follow-up fetch.
+  state.lastRows.forEach(r => state.meta.set(r.order_id, r));
+  renderResults();
+  renderPager();
+  renderSearchBadge(d);
+}
+
+function renderSearchBadge(d) {
+  const el = $('searchModeBadge');
+  if (!el) return;
+  if (d.mode === 'exact' && d.values_parsed > 1) {
+    el.textContent = `exact match · ${d.values_parsed} values`;
+  } else if (d.mode === 'prefix') {
+    el.textContent = `prefix match`;
+  } else {
+    el.textContent = '';
+  }
+}
+
+function renderResults() {
+  const rows = state.lastRows;
+  if (!rows.length) {
+    $('resultBody').innerHTML =
+      '<tr><td colspan="6" class="muted">No matches.</td></tr>';
+    $('headerCheck').checked = false;
+    return;
+  }
+  $('resultBody').innerHTML = rows.map(r => {
+    const checked = state.selected.has(r.order_id) ? 'checked' : '';
+    const cls = checked ? ' class="selected"' : '';
+    const curr = r.name || '';
+    const orig = (r.original_name == null) ? curr : r.original_name;
+    const editedCls = (curr !== orig) ? ' edited' : '';
+    return `<tr${cls} data-oid="${H(r.order_id)}">
+      <td class="check">
+        <input type="checkbox" class="rowck" ${checked}
+               data-oid="${H(r.order_id)}"></td>
+      <td class="mono">${H(r.order_id)}</td>
+      <td class="name-cell${editedCls}" data-oid="${H(r.order_id)}"
+          data-orig-name="${H(orig)}">
+        <span class="name-edit" contenteditable="true" spellcheck="false"
+              data-last="${H(curr)}"
+              title="Click to edit · Enter to save · Esc to cancel"
+              >${H(curr)}</span>
+        <div class="name-orig-hint">orig: ${H(orig)}</div>
+      </td>
+      <td class="mono">${H(r.cnic)}</td>
+      <td class="mono">${H(r.phone)}</td>
+      <td class="mono" style="color:#888; font-size:.75rem;">${H(r.created_at||'').slice(0,10)}</td>
+    </tr>`;
+  }).join('');
+  document.querySelectorAll('.rowck').forEach(cb => {
+    cb.addEventListener('change', () => {
+      const oid = cb.dataset.oid;
+      if (cb.checked) state.selected.add(oid);
+      else state.selected.delete(oid);
+      cb.closest('tr').classList.toggle('selected', cb.checked);
+      updateHeaderCheck();
+      onSelectionChanged();
+    });
+  });
+  // Inline name editor — save on blur, Enter commits, Esc reverts.
+  document.querySelectorAll('.name-edit').forEach(edit => {
+    edit.addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); edit.blur(); }
+      else if (e.key === 'Escape') {
+        edit.textContent = edit.dataset.last;
+        edit.blur();
+      }
+    });
+    edit.addEventListener('blur', () => saveNameEdit(edit));
+  });
+  updateHeaderCheck();
+}
+
+async function saveNameEdit(edit) {
+  const td   = edit.closest('td.name-cell');
+  const oid  = td.dataset.oid;
+  const orig = td.dataset.origName;   // import-time name (stable)
+  const last = edit.dataset.last;     // last-saved name
+  const next = edit.textContent.trim();
+  if (next === last) return;
+  td.classList.remove('saved', 'save-err');
+  td.classList.add('saving');
+  try {
+    const r = await fetch('/api/cases/update_name', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ order_id: oid, name: next }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'update failed');
+    edit.dataset.last = next;
+    td.classList.toggle('edited', next !== orig);
+    td.querySelector('.name-orig-hint').textContent = 'orig: ' + orig;
+    // Keep local caches in sync so the Selected panel + future
+    // checkbox flips see the corrected name without a refetch.
+    const meta = state.meta.get(oid);
+    if (meta) {
+      meta.name = next;
+      if (meta.original_name == null) meta.original_name = orig;
+    }
+    const idx = state.lastRows.findIndex(x => x.order_id === oid);
+    if (idx >= 0) {
+      state.lastRows[idx].name = next;
+      if (state.lastRows[idx].original_name == null) {
+        state.lastRows[idx].original_name = orig;
+      }
+    }
+    td.classList.remove('saving');
+    td.classList.add('saved');
+    setTimeout(() => td.classList.remove('saved'), 900);
+    if (state.selected.has(oid)) renderSelectedPanel();
+  } catch (e) {
+    td.classList.remove('saving');
+    td.classList.add('save-err');
+    edit.textContent = last;
+    setTimeout(() => td.classList.remove('save-err'), 1600);
+  }
+}
+
+function renderPager() {
+  const s = state.search;
+  const pages = Math.max(1, Math.ceil(s.total / s.limit));
+  const from = s.total ? (s.page-1)*s.limit + 1 : 0;
+  const to = Math.min(s.page * s.limit, s.total);
+  $('pagerInfo').textContent = s.total
+    ? `${from.toLocaleString()}–${to.toLocaleString()} of ${s.total.toLocaleString()}`
+    : '0 results';
+  $('pageLabel').textContent = `${s.page} / ${pages}`;
+  $('prevPage').disabled = s.page <= 1;
+  $('nextPage').disabled = s.page >= pages;
+}
+
+function updateHeaderCheck() {
+  const cks = [...document.querySelectorAll('.rowck')];
+  const hc = $('headerCheck');
+  if (!cks.length) { hc.checked = false; hc.indeterminate = false; return; }
+  const n = cks.filter(c => c.checked).length;
+  hc.checked = (n === cks.length);
+  hc.indeterminate = n > 0 && n < cks.length;
+}
+
+$('headerCheck').onclick = () => {
+  const on = $('headerCheck').checked;
+  document.querySelectorAll('.rowck').forEach(cb => {
+    cb.checked = on;
+    const oid = cb.dataset.oid;
+    if (on) state.selected.add(oid); else state.selected.delete(oid);
+    cb.closest('tr').classList.toggle('selected', on);
+  });
+  onSelectionChanged();
+};
+
+$('searchBtn').onclick = () => runSearch(1);
+$('searchQ').addEventListener('keydown', e => {
+  // Shift-Enter = newline (for multi-value paste); Enter = search.
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); runSearch(1); }
+});
+$('searchField').onchange = () => runSearch(1);
+$('prevPage').onclick = () => runSearch(state.search.page - 1);
+$('nextPage').onclick = () => runSearch(state.search.page + 1);
+
+$('selectPageBtn').onclick = () => {
+  state.lastRows.forEach(r => {
+    state.selected.add(r.order_id);
+    state.meta.set(r.order_id, r);
+  });
+  renderResults();
+  onSelectionChanged();
+};
+
+$('selectAllBtn').onclick = async () => {
+  const s = state.search;
+  const body = { field: s.field, q: s.q, cap: 50000 };
+  $('selectAllBtn').disabled = true;
+  try {
+    // POST so very-long multi-value `q` always fits.
+    const r = await fetch('/api/cases/search/ids', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'failed');
+    d.ids.forEach(id => state.selected.add(id));
+    if (d.capped) {
+      alert('Selected first ' + d.returned.toLocaleString()
+        + ' matching rows (of ' + d.total.toLocaleString()
+        + '). Narrow the filter to reach the rest.');
+    }
+    renderResults();
+    onSelectionChanged();
+  } catch (e) { alert('Select-all failed: ' + e.message); }
+  finally { $('selectAllBtn').disabled = false; }
+};
+
+$('clearSelBtn').onclick = clearSelection;
+$('selClearBtn2').onclick = clearSelection;
+
+function clearSelection() {
+  state.selected.clear();
+  renderResults();
+  onSelectionChanged();
+}
+
+// ── BULK MATCH (paste or Excel upload) ──────────────────────
+$('bulkMatchBtn').onclick = async () => {
+  const text = $('bulkText').value.trim();
+  const file = $('bulkFile').files[0];
+  const field = $('searchField').value;
+  if (!text && !file) {
+    alert('Paste values or pick an Excel first.'); return;
+  }
+  $('bulkMatchBtn').disabled = true;
+  $('bulkStatus').className = 'bulk-status';
+  $('bulkStatus').textContent = 'Matching…';
+  $('bulkMissing').classList.add('hidden');
+  try {
+    let d;
+    if (file) {
+      const fd = new FormData();
+      fd.append('excel', file);
+      fd.append('field', field);
+      const r = await fetch('/api/cases/bulk_match',
+                            { method:'POST', body: fd });
+      d = await r.json();
+      if (!r.ok) throw new Error(d.error || 'failed');
+    } else {
+      const values = text.split(/[\s,]+/).filter(Boolean);
+      const r = await fetch('/api/cases/bulk_match', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ field, values }),
+      });
+      d = await r.json();
+      if (!r.ok) throw new Error(d.error || 'failed');
+    }
+    d.matched_ids.forEach(id => state.selected.add(id));
+    (d.matched_meta || []).forEach(m => state.meta.set(m.order_id, m));
+    $('bulkStatus').className = 'bulk-status ok';
+    const srcStr = d.source_column
+      ? ` (from column <code>${H(d.source_column)}</code>)` : '';
+    $('bulkStatus').innerHTML =
+      `✓ ${d.matched_count.toLocaleString()} of ${d.total_values.toLocaleString()} `
+      + `added to selection${srcStr}`;
+    if (d.missing_count > 0) {
+      const sample = d.missing_sample.map(x => H(x)).join(' ');
+      $('bulkMissing').classList.remove('hidden');
+      $('bulkMissing').innerHTML =
+        `<strong>${d.missing_count.toLocaleString()} value(s) not in inventory</strong>`
+        + ` (sample):<span class="ids">${sample}</span>`;
+    }
+    onSelectionChanged();
+  } catch (e) {
+    $('bulkStatus').className = 'bulk-status err';
+    $('bulkStatus').textContent = 'Match failed: ' + e.message;
+  } finally {
+    $('bulkMatchBtn').disabled = false;
+  }
+};
+
+// ── SELECTION PANEL (meta cache + render) ───────────────────
+async function onSelectionChanged() {
+  updateSelN();
+  await ensureMetaLoaded();
+  renderSelectedPanel();
+}
+
+async function ensureMetaLoaded() {
+  const need = [];
+  for (const id of state.selected) {
+    if (!state.meta.has(id)) need.push(id);
+  }
+  if (need.length === 0) return;
+  // Chunk so a 40 k selection doesn't pin the backend on a single
+  // giant JSON blob.
+  for (let i = 0; i < need.length; i += 5000) {
+    const chunk = need.slice(i, i + 5000);
+    try {
+      const r = await fetch('/api/cases/by_ids', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ order_ids: chunk }),
+      });
+      const d = await r.json();
+      (d.rows || []).forEach(row => state.meta.set(row.order_id, row));
+    } catch (e) { /* silent; panel shows id-only rows */ }
+  }
+}
+
+function renderSelectedPanel() {
+  const ids = [...state.selected];
+  const n = ids.length;
+  $('selectedSummary').textContent =
+    n === 0 ? 'nothing selected'
+            : `${n.toLocaleString()} selected`;
+  const body = $('selectedBody');
+  if (n === 0) {
+    body.innerHTML =
+      '<tr><td colspan="5" class="muted">Nothing selected yet. '
+      + 'Check rows in the search table, click "Select all matching", '
+      + 'or use "Bulk select from file" above.</td></tr>';
+    $('selTruncateNote').textContent = '';
+    return;
+  }
+  const shown = ids.slice(0, MAX_SEL_DISPLAY);
+  body.innerHTML = shown.map(id => {
+    const m = state.meta.get(id) || { order_id: id };
+    const edited = m.original_name && m.original_name !== m.name;
+    const nameTd = edited
+      ? `<td title="Original: ${H(m.original_name)}">${H(m.name)} `
+        + `<span style="color:var(--muted); font-size:.72rem; font-style:italic;">(edited)</span></td>`
+      : `<td>${H(m.name)}</td>`;
+    return `<tr data-oid="${H(id)}">
+      <td class="del"><button title="Remove" data-oid="${H(id)}">✕</button></td>
+      <td class="mono">${H(id)}</td>
+      ${nameTd}
+      <td class="mono">${H(m.cnic)}</td>
+      <td class="mono">${H(m.phone)}</td>
+    </tr>`;
+  }).join('');
+  body.querySelectorAll('button[data-oid]').forEach(btn => {
+    btn.onclick = () => {
+      const oid = btn.dataset.oid;
+      state.selected.delete(oid);
+      renderResults();
+      onSelectionChanged();
+    };
+  });
+  $('selTruncateNote').textContent =
+    n > MAX_SEL_DISPLAY
+      ? `showing first ${MAX_SEL_DISPLAY.toLocaleString()} of ${n.toLocaleString()}`
+      : '';
+}
+
+// Keep one order_id per distinct `field` value (name / cnic). Rows
+// that haven't been meta-loaded yet are left alone — the user can
+// re-run dedupe after the panel fully renders.
+function dedupeBy(field) {
+  const firstFor = new Map();
+  const withoutMeta = new Set();
+  for (const id of state.selected) {
+    const m = state.meta.get(id);
+    if (!m) { withoutMeta.add(id); continue; }
+    const k = (m[field] || '').trim().toLowerCase();
+    if (!k) { withoutMeta.add(id); continue; }
+    if (!firstFor.has(k)) firstFor.set(k, id);
+  }
+  const kept = new Set(firstFor.values());
+  const before = state.selected.size;
+  state.selected = new Set([...kept, ...withoutMeta]);
+  const removed = before - state.selected.size;
+  if (removed > 0) {
+    $('bulkStatus').className = 'bulk-status ok';
+    $('bulkStatus').textContent =
+      `Dedupe by ${field}: removed ${removed.toLocaleString()} duplicate row(s).`;
+  }
+  renderResults();
+  onSelectionChanged();
+}
+$('selDedupeNameBtn').onclick = () => dedupeBy('name');
+$('selDedupeCnicBtn').onclick = () => dedupeBy('cnic');
+
+function updateSelN() {
+  const n = state.selected.size;
+  $('selN').textContent = n.toLocaleString();
+  $('generateBtn').disabled = (n === 0);
+}
+
+// ── GENERATE ────────────────────────────────────────────────
+$('generateBtn').onclick = async () => {
+  if (state.selected.size === 0) return;
+  const order_ids = [...state.selected];
+  const body = {
+    template_slug: $('tplSelect').value,
+    order_ids,
+    date_value: $('dateInput').value || '',
+    machine: $('profileSelect').value,
+    filename_fields: ($('fnFields').value || 'name')
+                     .split(',').map(s => s.trim()).filter(Boolean),
+    group_by_field: ($('groupBy').value || '').trim() || null,
+  };
+  $('generateBtn').disabled = true;
+  $('genDownloads').innerHTML = '';
+  $('genProgressBox').classList.remove('hidden');
+  $('genBar').style.width = '0%';
+  $('genMsg').className = 'progress-msg';
+  $('genMsg').textContent = 'Queuing…';
+  try {
+    const r = await fetch('/api/cases/generate', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'failed');
+    state.genTaskId = d.task_id;
+    pollGenerate();
+  } catch (e) {
+    $('genMsg').className = 'progress-msg err';
+    $('genMsg').textContent = 'Error: ' + e.message;
+    $('generateBtn').disabled = false;
+  }
+};
+
+async function pollGenerate() {
+  const tid = state.genTaskId;
+  if (!tid) return;
+  try {
+    const r = await fetch('/status/' + tid);
+    const d = await r.json();
+    const pct = d.total ? Math.round((d.progress / d.total) * 100) : 0;
+    $('genBar').style.width = pct + '%';
+    const prog = d.total ? ` (${d.progress}/${d.total})` : '';
+    const groupInfo = (d.groups_total > 1)
+      ? `  ·  group ${d.groups_done || 0}/${d.groups_total}`
+      : '';
+    $('genMsg').textContent = (d.message || '') + prog + groupInfo;
+    if (d.status === 'done') {
+      // Wait for the post-render wrap step to replace per-group parts
+      // with the single batch zip. /status also reflects the updated
+      // message, but ready_parts is the authoritative signal.
+      renderBatchDownload(d.ready_parts || []);
+      $('genMsg').className = 'progress-msg ok';
+      $('generateBtn').disabled = false;
+      return;
+    }
+    if (d.status === 'error') {
+      $('genMsg').className = 'progress-msg err';
+      $('genMsg').textContent = d.error || d.message || 'failed';
+      $('generateBtn').disabled = false;
+      return;
+    }
+    setTimeout(pollGenerate, 800);
+  } catch (e) {
+    $('genMsg').className = 'progress-msg err';
+    $('genMsg').textContent = 'Polling failed: ' + e.message;
+  }
+}
+
+function renderBatchDownload(parts) {
+  const box = $('genDownloads');
+  box.innerHTML = '';
+  if (!parts.length) return;
+  parts.forEach(p => {
+    const a = document.createElement('a');
+    a.href = `/download/${state.genTaskId}/${p.index}`;
+    a.textContent = `⬇ ${p.name}`;
+    a.setAttribute('download', p.name);
+    a.style.fontWeight = '600';
+    a.style.fontSize = '.88rem';
+    box.appendChild(a);
+  });
+}
+
+boot();
+</script>
+</body>
+</html>
+"""
+
+
 LOGIN_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="en">
@@ -4050,6 +6106,7 @@ LOGO_DATA_URI = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAqwAAAE6CAYAAADTF
 HTML_TEMPLATE = HTML_TEMPLATE.replace("__LOGO_DATA_URI__", LOGO_DATA_URI)
 LOGIN_TEMPLATE = LOGIN_TEMPLATE.replace("__LOGO_DATA_URI__", LOGO_DATA_URI)
 VERIFY_TEMPLATE = VERIFY_TEMPLATE.replace("__LOGO_DATA_URI__", LOGO_DATA_URI)
+INVENTORY_TEMPLATE = INVENTORY_TEMPLATE.replace("__LOGO_DATA_URI__", LOGO_DATA_URI)
 
 
 

@@ -2,6 +2,120 @@
 
 本文件记录项目的重要变更。格式：按日期倒序，最新的变更在最上面。
 
+## 2026-04-18 (存量下载模式)
+
+全新工作流：一次性把整批案件导入系统，之后只需搜索、选择、生成律师函——
+不用每次重传 Excel。解决的场景是："客户手里几千到几十万条存量，但每次只
+想对其中 N 条发函"。
+
+### 新增
+
+- **`/inventory` 单页面 + 📦 Inventory 导航链接**
+  - 布局：1 Import → 2 Search & Select → 2.5 Selected Cases → 3 Generate
+  - 底部粘性操作条始终显示当前选中数；"已选择" 面板独立出来方便全量审核
+  - 与原工作台共用登录 + 主题
+
+- **案件存储 `uploads/cases.db`（SQLite + WAL）**
+  - Schema `(order_id PK, cnic, name, original_name, phone, row_json,
+    created_at, updated_at)` + `cnic / name / phone` 三个索引
+  - `order_id` 对应 Excel 的 `订单编号` 列（支持中英文 alias），TEXT 类型
+    ——业务 ID 有 19 位 bigint，超 SQLite INTEGER 的 8 字节范围
+  - `row_json` 存整行 Excel 原始数据，兼容 Excel 新增列；冗余
+    `cnic / name / phone` 列只为驱动索引
+  - 支持几十万行：导入异步分批 1000 行 commit；搜索单值前缀 LIKE，多值走
+    TEMP 表 JOIN（绕过 SQLite 999 bind 参数上限）
+
+- **两阶段导入（冲突透明处理）**
+  - `POST /api/cases/import/preview`：上传 Excel 后流式扫 `订单编号` 列，
+    返回 `{total, new_count, conflict_count, dup_in_file_count,
+    conflicts_sample, token, headers, order_id_col, cnic_col, name_col,
+    phone_col}`——用户先看到"N 条重复"再决定
+  - `POST /api/cases/import/commit`：body `{token, policy: "skip"|"overwrite"}`
+    → 异步 task，`/status/<tid>` 轮询进度
+  - **skip** 保留既有行（INSERT OR IGNORE）；**overwrite** UPDATE+fallback INSERT，
+    `original_name` 随之重置为新导入值
+  - 测试：4439 行 Excel 导入 < 1 s，重复导入 skip/overwrite 都正确计数
+
+- **搜索支持多值 —— 一个端点三种模式**
+  - `GET|POST /api/cases/search`：按 cnic/name/phone 分页查
+  - **空 q** → 全部；**单值** → 前缀 LIKE（索引命中）；**多值**
+    （逗号/空格/换行分隔）→ TEMP 表 JOIN 精确匹配
+  - 响应带 `mode: all|prefix|exact` 和 `values_parsed` 便于前端显示模式徽标
+  - `GET|POST /api/cases/search/ids`：同样三种模式，直接返回所有匹配
+    order_id（cap=50 k），喂"全选匹配结果"按钮
+  - POST 变体是为了超长粘贴准备（> ~3 KB 绕开浏览器 URL 长度限制）
+
+- **批量匹配 `POST /api/cases/bulk_match`**（跑量场景的最优解）
+  - 两种输入：`multipart/form-data {field, excel}`（读 Excel 首个匹配列，
+    按 alias 找 CNIC/Name/Phone 列）或 `application/json {field, values:[]}`
+  - 返回 `{matched_count, missing_count, matched_ids[], matched_meta[..200],
+    missing_sample[..200], source_column}`——前端一键加入选择，并列出最多
+    200 条"不在库中"的值让用户跟进
+  - 上限 10 万条值
+
+- **内联编辑 name + `original_name` 审计字段**
+  - `POST /api/cases/update_name` `{order_id, name}`：同时更新 `cases.name`
+    索引列 **和** `row_json["name"]`（渲染器读的字段），保证改名立即对下次
+    搜索 + 生成都生效
+  - `original_name` 列导入时写入，**编辑操作永不触碰**；启动时
+    `ALTER TABLE ... ADD COLUMN original_name` + 全表 backfill，老 DB 无感升级
+  - UI：搜索结果表 Name 单元格 `contenteditable`，Enter 保存 / Esc 撤销；
+    保存成功底部小字显示 `orig: <原名>`，已选面板 `(edited)` 小标 + title
+    tooltip
+
+- **外层批次 zip + 按 `负责人` 分组（默认）**
+  - `POST /api/cases/generate` 默认 `group_by_field = "负责人"`——每个
+    负责人一个 `<负责人>.zip`，再用 `ZIP_STORED` 打进外层
+    `YYYY-MM-DD_batch-NNN.zip`
+  - 批次号按当日自动 +1：扫 `uploads/inventory_batches/` 下已有匹配
+    `YYYY-MM-DD_batch-NNN.zip` 的文件取 `max(N)+1`，`_BATCH_COUNTER_LOCK`
+    并发安全
+  - 外层 zip 用 `ZIP_STORED` 无压缩——内层 zip 已经 DEFLATED，二次压缩纯
+    浪费 CPU
+  - 外层 zip **持久化**存 `uploads/inventory_batches/`，`/download` 对
+    `persistent=True` 的 part 跳过 10 分钟清理计时器 → 天然归档（可过几天
+    再重新下载）
+  - Advanced 里可改 `group_by_field` 列名，或传 `__none__` 明确不分组
+
+### 变更
+
+- 工作台 header 加 📦 **Inventory** 和 🔍 **Verify** 两个导航链接
+- `/download/<tid>/<part_index>` 的 10 分钟清理计时器对
+  `ready_parts[i].persistent == True` 的 part 跳过
+- `TASKS` dict 和 `/status/<tid>` / `/download/<tid>/<idx>` 端点被存量模式
+  直接复用——进度字段通用，不需要新接口
+
+### 架构要点
+
+- **复用现有渲染流水线**：`_wrap_inventory_batch` 在 `generate_notices_html`
+  返回后跑，不动核心管线
+- **TEMP 表多值搜索**：`CREATE TEMP TABLE _srch_q(v TEXT PRIMARY KEY)` +
+  `executemany INSERT` + JOIN 查询，绕过 999 参数上限且单 SQL 一次搞定，
+  不需要分页合并
+- **前端状态**：`state.selected: Set<order_id>` 是真源，`state.meta: Map`
+  是显示缓存。跨页选择不丢；缺 meta 的 id 批量走 `/api/cases/by_ids` 补
+- **数据库兼容**：列名 alias（`_find_col`）让 Excel 可以是中文头
+  （`订单编号 / 姓名 / CNIC / 注册手机号`）或英文头（`order_id / name / cnic
+  / phone`）——与现有批量模式的 Excel 格式二者兼容
+
+### 新增 API 端点
+
+全部 `/api/cases/*`，都走现有认证（未登录返 401 JSON）：
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| `GET` | `/api/cases/stats` | `{count: N}` |
+| `POST` | `/api/cases/import/preview` | Excel 上传 → 扫冲突，返 token + 统计 |
+| `POST` | `/api/cases/import/commit` | `{token, policy}` → `{task_id}` |
+| `GET\|POST` | `/api/cases/search` | 分页搜（三模式） |
+| `GET\|POST` | `/api/cases/search/ids` | 所有匹配 order_id |
+| `POST` | `/api/cases/bulk_match` | Excel/JSON 批量匹配 |
+| `POST` | `/api/cases/by_ids` | 按 order_ids 批量取 `{name, original_name, cnic, phone}` |
+| `POST` | `/api/cases/update_name` | 内联改 name（保留 original_name） |
+| `POST` | `/api/cases/delete` | 按 order_ids 删除 / `{all:true}` 清空 |
+| `POST` | `/api/cases/generate` | 选中生成 → `{task_id}`（复用 `/status` + `/download`） |
+| `GET` | `/inventory` | HTML 单页 |
+
 ## 2026-04-16 (安全加固 + 历史审计)
 
 一次把 `/review` 扫出来的 Top-5 全修了，同时落地**历史记录 + 序列号反查**。
